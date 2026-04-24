@@ -59,3 +59,22 @@ class SoftDeleteMixin:
         nullable=True,
         default=None,
     )
+
+
+from sqlalchemy import Enum as SAEnum
+
+
+def pg_enum(enum_cls: type, name: str) -> SAEnum:
+    """Bind a Python Enum to an existing Postgres ENUM type.
+
+    - ``create_type=False``: the Postgres type already exists (migration
+      ``8c5d604ee81d_extensions_and_enums`` created all 11 enums).
+    - ``values_callable``: send enum ``.value`` strings to Postgres instead of
+      member names (SQLAlchemy sends names by default, which Postgres rejects).
+    """
+    return SAEnum(
+        enum_cls,
+        name=name,
+        create_type=False,
+        values_callable=lambda cls: [m.value for m in cls],
+    )
