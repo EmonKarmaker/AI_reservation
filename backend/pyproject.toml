@@ -24,8 +24,10 @@ dependencies = [
     "python-jose[cryptography]>=3.3.0",
     "passlib[bcrypt]>=1.7.4",
 
-    # Encryption
+# Encryption
     "cryptography>=42.0.0",
+    # Vector DB
+    "pgvector>=0.3.0",
 ]
 
 [project.optional-dependencies]
