@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import (
@@ -15,10 +16,17 @@ from sqlalchemy import (
     Numeric,
     Text,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDMixin, pg_enum
 from app.models.enums import BookingStatus
+
+if TYPE_CHECKING:
+    from app.models.business import Business
+    from app.models.conversation import Conversation
+    from app.models.customer import Customer
+    from app.models.payment import Payment
+    from app.models.service import Service
 
 
 class Booking(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
@@ -36,8 +44,6 @@ class Booking(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
         ForeignKey("services.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    # Forward FK reference: the ``conversations`` table is defined in Phase 1.3c.
-    # SQLAlchemy resolves string-based FKs at configure time, so declaring it now is safe.
     conversation_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("conversations.id", ondelete="SET NULL"),
         nullable=True,
@@ -56,6 +62,16 @@ class Booking(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     idempotency_key: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancelled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    business: Mapped["Business"] = relationship(back_populates="bookings")
+    customer: Mapped["Customer"] = relationship(back_populates="bookings")
+    service: Mapped["Service"] = relationship(back_populates="bookings")
+    conversation: Mapped["Conversation | None"] = relationship(
+        back_populates="booking", foreign_keys=[conversation_id]
+    )
+    payments: Mapped[list["Payment"]] = relationship(
+        back_populates="booking", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         CheckConstraint("ends_at > starts_at", name="ck_bookings_ends_after_starts"),

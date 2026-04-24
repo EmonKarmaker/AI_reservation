@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Index, Integer, Numeric, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDMixin
+
+if TYPE_CHECKING:
+    from app.models.booking import Booking
+    from app.models.business import Business
 
 
 class Service(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
@@ -26,6 +31,9 @@ class Service(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     display_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    business: Mapped["Business"] = relationship(back_populates="services")
+    bookings: Mapped[list["Booking"]] = relationship(back_populates="service")
 
     __table_args__ = (
         CheckConstraint(

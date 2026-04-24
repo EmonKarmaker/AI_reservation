@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from sqlalchemy import DateTime, ForeignKey, Index, Text, text
 from sqlalchemy.dialects.postgresql import CITEXT, JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDMixin, pg_enum
 from app.models.enums import EscalationPriority, EscalationStatus
+
+if TYPE_CHECKING:
+    from app.models.business import Business
+    from app.models.conversation import Conversation
+    from app.models.user import User
 
 
 class Escalation(UUIDMixin, TimestampMixin, Base):
@@ -48,6 +53,12 @@ class Escalation(UUIDMixin, TimestampMixin, Base):
     )
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     email_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    business: Mapped["Business"] = relationship(back_populates="escalations")
+    conversation: Mapped["Conversation"] = relationship(back_populates="escalations")
+    resolved_by_user: Mapped["User | None"] = relationship(
+        back_populates="resolved_escalations", foreign_keys=[resolved_by]
+    )
 
     __table_args__ = (
         Index("ix_escalations_business_id", "business_id"),

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from datetime import date, time
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import Boolean, Date, ForeignKey, Text, Time, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDMixin
+
+if TYPE_CHECKING:
+    from app.models.business import Business
 
 
 class ScheduleException(UUIDMixin, TimestampMixin, Base):
@@ -23,6 +27,8 @@ class ScheduleException(UUIDMixin, TimestampMixin, Base):
     open_time: Mapped[time | None] = mapped_column(Time, nullable=True)
     close_time: Mapped[time | None] = mapped_column(Time, nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    business: Mapped["Business"] = relationship(back_populates="schedule_exceptions")
 
     __table_args__ = (
         UniqueConstraint(

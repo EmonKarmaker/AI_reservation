@@ -1,25 +1,23 @@
 """Embedding model — polymorphic vector store across business/service/faq.
 
-The ``embedding`` column uses pgvector with 384 dimensions (MiniLM output).
-Declares the HNSW cosine-similarity index; if Alembic autogenerate misses it
-in Phase 1.4, we'll add it as an explicit migration step.
-
-Postgres column is named ``metadata``, Python attribute is ``extra_data`` to
-avoid SQLAlchemy's reserved name conflict.
+Postgres column is named ``metadata``, Python attribute is ``extra_data``.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import ForeignKey, Index, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDMixin, pg_enum
 from app.models.enums import EmbeddingSourceType
+
+if TYPE_CHECKING:
+    from app.models.business import Business
 
 
 class Embedding(UUIDMixin, TimestampMixin, Base):
@@ -42,6 +40,8 @@ class Embedding(UUIDMixin, TimestampMixin, Base):
         nullable=False,
         server_default=text("'{}'::jsonb"),
     )
+
+    business: Mapped["Business"] = relationship(back_populates="embeddings")
 
     __table_args__ = (
         UniqueConstraint("source_type", "source_id", name="uq_embeddings_source"),

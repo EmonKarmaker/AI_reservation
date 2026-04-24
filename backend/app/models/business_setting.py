@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import Boolean, ForeignKey, Integer, Text
 from sqlalchemy.dialects.postgresql import CITEXT
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDMixin
+
+if TYPE_CHECKING:
+    from app.models.business import Business
 
 
 class BusinessSetting(UUIDMixin, TimestampMixin, Base):
@@ -32,3 +36,5 @@ class BusinessSetting(UUIDMixin, TimestampMixin, Base):
     escalation_email: Mapped[str | None] = mapped_column(CITEXT(), nullable=True)
     max_daily_bookings: Mapped[int | None] = mapped_column(Integer, nullable=True)
     custom_api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    business: Mapped["Business"] = relationship(back_populates="settings")

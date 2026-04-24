@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import Boolean, ForeignKey, Index, Integer, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDMixin
+
+if TYPE_CHECKING:
+    from app.models.business import Business
 
 
 class Faq(UUIDMixin, TimestampMixin, Base):
@@ -22,6 +26,8 @@ class Faq(UUIDMixin, TimestampMixin, Base):
     category: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     display_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+    business: Mapped["Business"] = relationship(back_populates="faqs")
 
     __table_args__ = (
         Index("ix_faqs_business_id", "business_id"),

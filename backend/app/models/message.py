@@ -1,21 +1,24 @@
 """Message model — one turn of a conversation. Immutable (no updated_at).
 
-Postgres column is named ``metadata``, but the Python attribute is ``extra_data``
+Postgres column is named ``metadata``, Python attribute is ``extra_data``
 because ``metadata`` is reserved on SQLAlchemy's DeclarativeBase.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from sqlalchemy import DateTime, ForeignKey, Index, Integer, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, UUIDMixin, pg_enum
 from app.models.enums import MessageRole
+
+if TYPE_CHECKING:
+    from app.models.conversation import Conversation
 
 
 class Message(UUIDMixin, Base):
@@ -43,6 +46,8 @@ class Message(UUIDMixin, Base):
         server_default=func.now(),
         nullable=False,
     )
+
+    conversation: Mapped["Conversation"] = relationship(back_populates="messages")
 
     __table_args__ = (
         Index("ix_messages_conversation_id", "conversation_id"),

@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from sqlalchemy import CHAR, Index, Integer, Text
 from sqlalchemy.dialects.postgresql import CITEXT
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDMixin, pg_enum
 from app.models.enums import BusinessStatus
+
+if TYPE_CHECKING:
+    from app.models.booking import Booking
+    from app.models.business_setting import BusinessSetting
+    from app.models.conversation import Conversation
+    from app.models.customer import Customer
+    from app.models.embedding import Embedding
+    from app.models.escalation import Escalation
+    from app.models.faq import Faq
+    from app.models.operating_hours import OperatingHours
+    from app.models.payment import Payment
+    from app.models.schedule_exception import ScheduleException
+    from app.models.service import Service
+    from app.models.user import User
 
 
 class Business(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
@@ -34,6 +50,41 @@ class Business(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     booking_window_days: Mapped[int] = mapped_column(Integer, nullable=False, server_default="60")
     cancellation_hours: Mapped[int] = mapped_column(Integer, nullable=False, server_default="24")
     stripe_account_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    settings: Mapped["BusinessSetting | None"] = relationship(
+        back_populates="business", cascade="all, delete-orphan", uselist=False
+    )
+    users: Mapped[list["User"]] = relationship(back_populates="business")
+    services: Mapped[list["Service"]] = relationship(
+        back_populates="business", cascade="all, delete-orphan"
+    )
+    customers: Mapped[list["Customer"]] = relationship(
+        back_populates="business", cascade="all, delete-orphan"
+    )
+    bookings: Mapped[list["Booking"]] = relationship(
+        back_populates="business", cascade="all, delete-orphan"
+    )
+    payments: Mapped[list["Payment"]] = relationship(
+        back_populates="business", cascade="all, delete-orphan"
+    )
+    conversations: Mapped[list["Conversation"]] = relationship(
+        back_populates="business", cascade="all, delete-orphan"
+    )
+    escalations: Mapped[list["Escalation"]] = relationship(
+        back_populates="business", cascade="all, delete-orphan"
+    )
+    faqs: Mapped[list["Faq"]] = relationship(
+        back_populates="business", cascade="all, delete-orphan"
+    )
+    embeddings: Mapped[list["Embedding"]] = relationship(
+        back_populates="business", cascade="all, delete-orphan"
+    )
+    operating_hours: Mapped[list["OperatingHours"]] = relationship(
+        back_populates="business", cascade="all, delete-orphan"
+    )
+    schedule_exceptions: Mapped[list["ScheduleException"]] = relationship(
+        back_populates="business", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         Index("ix_businesses_status", "status"),

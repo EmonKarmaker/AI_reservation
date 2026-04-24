@@ -1,17 +1,24 @@
-"""Conversation model — one row per chat session or voice call. Shared table distinguished by ``channel``."""
+"""Conversation model — one row per chat session or voice call."""
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from sqlalchemy import DateTime, ForeignKey, Index, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDMixin, pg_enum
 from app.models.enums import ConversationChannel, ConversationStatus
+
+if TYPE_CHECKING:
+    from app.models.booking import Booking
+    from app.models.business import Business
+    from app.models.customer import Customer
+    from app.models.escalation import Escalation
+    from app.models.message import Message
 
 
 class Conversation(UUIDMixin, TimestampMixin, Base):
@@ -51,6 +58,16 @@ class Conversation(UUIDMixin, TimestampMixin, Base):
         nullable=True,
     )
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    business: Mapped["Business"] = relationship(back_populates="conversations")
+    customer: Mapped["Customer | None"] = relationship(back_populates="conversations")
+    booking: Mapped["Booking | None"] = relationship(
+        back_populates="conversation", foreign_keys="Booking.conversation_id"
+    )
+    messages: Mapped[list["Message"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan"
+    )
+    escalations: Mapped[list["Escalation"]] = relationship(back_populates="conversation")
 
     __table_args__ = (
         Index("ix_conversations_business_id", "business_id"),

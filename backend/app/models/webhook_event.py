@@ -1,3 +1,4 @@
+
 """WebhookEvent — idempotency log for Stripe and Vapi webhooks."""
 
 from __future__ import annotations
