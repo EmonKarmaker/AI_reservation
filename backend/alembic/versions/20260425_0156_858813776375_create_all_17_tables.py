@@ -75,7 +75,7 @@ def upgrade() -> None:
         sa.Column('logo_url', sa.Text(), nullable=True),
         sa.Column(
             'status',
-            sa.Enum('active', 'suspended', 'pending', name='business_status'),
+            postgresql.ENUM('active', 'suspended', 'pending', name='business_status', create_type=False),
             server_default='active',
             nullable=False,
         ),
@@ -102,7 +102,7 @@ def upgrade() -> None:
         sa.Column('full_name', sa.Text(), nullable=False),
         sa.Column(
             'role',
-            sa.Enum('super_admin', 'business_admin', name='user_role'),
+            postgresql.ENUM('super_admin', 'business_admin', name='user_role', create_type=False),
             nullable=False,
         ),
         sa.Column('business_id', sa.UUID(), nullable=True),
@@ -149,7 +149,7 @@ def upgrade() -> None:
         sa.Column('business_id', sa.UUID(), nullable=False),
         sa.Column(
             'day_of_week',
-            sa.Enum('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun', name='day_of_week'),
+            postgresql.ENUM('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun', name='day_of_week', create_type=False),
             nullable=False,
         ),
         sa.Column('open_time', sa.Time(), nullable=False),
@@ -272,7 +272,7 @@ def upgrade() -> None:
         sa.Column('business_id', sa.UUID(), nullable=False),
         sa.Column(
             'source_type',
-            sa.Enum('business', 'service', 'faq', name='embedding_source_type'),
+            postgresql.ENUM('business', 'service', 'faq', name='embedding_source_type', create_type=False),
             nullable=False,
         ),
         sa.Column('source_id', sa.UUID(), nullable=False),
@@ -386,9 +386,10 @@ def upgrade() -> None:
         sa.Column('ends_at', sa.DateTime(timezone=True), nullable=False),
         sa.Column(
             'status',
-            sa.Enum(
+            postgresql.ENUM(
                 'pending_payment', 'confirmed', 'cancelled', 'completed', 'no_show',
                 name='booking_status',
+                create_type=False,
             ),
             server_default='pending_payment',
             nullable=False,
@@ -429,12 +430,12 @@ def upgrade() -> None:
         sa.Column('customer_id', sa.UUID(), nullable=True),
         sa.Column(
             'channel',
-            sa.Enum('chat', 'voice', name='conversation_channel'),
+            postgresql.ENUM('chat', 'voice', name='conversation_channel', create_type=False),
             nullable=False,
         ),
         sa.Column(
             'status',
-            sa.Enum('active', 'completed', 'abandoned', 'escalated', name='conversation_status'),
+            postgresql.ENUM('active', 'completed', 'abandoned', 'escalated', name='conversation_status', create_type=False),
             server_default='active',
             nullable=False,
         ),
@@ -483,7 +484,7 @@ def upgrade() -> None:
         sa.Column('conversation_id', sa.UUID(), nullable=False),
         sa.Column(
             'role',
-            sa.Enum('user', 'assistant', 'system', 'tool', name='message_role'),
+            postgresql.ENUM('user', 'assistant', 'system', 'tool', name='message_role', create_type=False),
             nullable=False,
         ),
         sa.Column('content', sa.Text(), nullable=False),
@@ -519,7 +520,7 @@ def upgrade() -> None:
         sa.Column('currency', sa.CHAR(length=3), nullable=False),
         sa.Column(
             'status',
-            sa.Enum('pending', 'succeeded', 'failed', 'refunded', name='payment_status'),
+            postgresql.ENUM('pending', 'succeeded', 'failed', 'refunded', name='payment_status', create_type=False),
             server_default='pending',
             nullable=False,
         ),
@@ -553,13 +554,13 @@ def upgrade() -> None:
         sa.Column('reason', sa.Text(), nullable=False),
         sa.Column(
             'priority',
-            sa.Enum('low', 'medium', 'high', name='escalation_priority'),
+            postgresql.ENUM('low', 'medium', 'high', name='escalation_priority', create_type=False),
             server_default='medium',
             nullable=False,
         ),
         sa.Column(
             'status',
-            sa.Enum('open', 'in_progress', 'resolved', 'dismissed', name='escalation_status'),
+            postgresql.ENUM('open', 'in_progress', 'resolved', 'dismissed', name='escalation_status', create_type=False),
             server_default='open',
             nullable=False,
         ),
