@@ -1,33 +1,47 @@
-# Session Log — Phase 1 Data Layer Complete (1.1–1.4); Phase 1.5 Next
+# Session Log — Phase 1 Complete; Phase 2 Next
 
 ## What this document is
-This is the **handoff state** of the AI Reservation SaaS project. When a new Claude chat session starts, read this first (after reading `CLAUDE.md` at the project root and the other 8 docs in `docs/`). It captures what's done, what decisions were made that override earlier docs, and what's next.
+This is the **handoff state** of the AI Reservation SaaS project. New Claude chats should read this after `CLAUDE.md` and the other 8 docs in `docs/`. It captures what's done, what decisions override the planning docs, and what's next.
 
 ---
 
 ## Project state as of handoff
 
 **Phase 0 — COMPLETE.**
-**Phase 1.1 through 1.4 — COMPLETE.** Database now has all 17 tables live.
-**Phase 1.5 — NEXT** (security utilities: `app/core/security.py`, `app/core/encryption.py`).
+**Phase 1 (all sub-phases 1.1–1.8c) — COMPLETE.** Auth works end-to-end with cookies, 4 integration tests pass.
+**Phase 2 — NEXT** (business admin dashboard shell + core CRUD).
 
-Commit history:
+### Commit history
 
 Phase 0:
 - `546250c` — feat(phase-0): project setup complete (backend skeleton, migration, docs)
 - `d529605` — feat(phase-0): frontend scaffold (Next.js 16, shadcn/ui)
 
-Phase 1:
-- `5aa6859` — feat(phase-1.1): SQLAlchemy Base, mixins, and Postgres enum classes
+Phase 1.1–1.4 (data layer):
+- `5aa6859` — feat(phase-1.1): SQLAlchemy Base, mixins, Postgres enum classes
 - `662cae5` — feat(phase-1.2): platform-level models (User, PlatformSetting, AuditLog)
-- `b90f76b` — feat(phase-1.3a): business tenant foundation models (Business, BusinessSetting, OperatingHours, ScheduleException)
-- `0990d52` — feat(phase-1.3b): booking core models (Service, Customer, Booking, Payment)
-- `64727b5` — feat(phase-1.3c): AI + infra models (Conversation, Message, Escalation, Faq, Embedding, WebhookEvent); all 17 tables defined
-- `688892f` — feat(phase-1.3d): wire SQLAlchemy relationships across all models
-- `b7fa17e` — feat(phase-1.4a): wire Base.metadata into Alembic with pgvector render + enum skip hooks
-- `3de3f91` — feat(phase-1.4bc): generate and patch migration for all 17 tables (resolve bookings<->conversations FK cycle, fix audit_logs DESC index)
-- `3e16890` — fix(phase-1.4c): use postgresql.ENUM with create_type=False so migration applies cleanly
-- `7c80a3e` — feat(phase-1.4d): apply migration; add verify_tables.py helper script
+- `b90f76b` — feat(phase-1.3a): business tenant foundation models
+- `0990d52` — feat(phase-1.3b): booking core models
+- `64727b5` — feat(phase-1.3c): AI + infra models; all 17 tables defined
+- `688892f` — feat(phase-1.3d): wire SQLAlchemy relationships
+- `b7fa17e` — feat(phase-1.4a): wire Base.metadata into Alembic
+- `3de3f91` — feat(phase-1.4bc): generate and patch migration
+- `3e16890` — fix(phase-1.4c): use postgresql.ENUM with create_type=False
+- `7c80a3e` — feat(phase-1.4d): apply migration; add verify_tables.py
+- `57561e4` — docs: update session log (Phase 1.4 complete)
+
+Phase 1.5–1.6 (security + DB session):
+- `a4d492c` — feat(phase-1.5): security utils (JWT + bcrypt) and Fernet encryption
+- `5633b78` — feat(phase-1.6): async DB session factory and FastAPI permission dependencies
+
+Phase 1.7 (auth endpoints):
+- `017c4ab` — feat(phase-1.7a): auth schemas (Pydantic) and service layer
+- `0578c43` — feat(phase-1.7b): auth router with 5 endpoints mounted at /api/v1/auth
+
+Phase 1.8 (bootstrap + seed + tests):
+- `5a678b9` — feat(phase-1.8a): super admin bootstrap script
+- (1.8b commit) — feat(phase-1.8b): seed 3 demo businesses with services, hours, and FAQs
+- (1.8c commit) — feat(phase-1.8c): pytest setup and 4 integration tests for auth
 
 ---
 
@@ -35,154 +49,186 @@ Phase 1:
 
 ### Backend (`backend/`)
 - Python 3.11.9 in `.venv`
-- FastAPI 0.136.0 + async SQLAlchemy 2.0.49 + asyncpg 0.31.0 + Pydantic 2.13.3 + pgvector 0.4.2 (Python lib)
-- `app/main.py` with `/health` endpoint returning `{"status":"ok"}`
-- `app/config.py` using `pydantic-settings`, loads from `.env`
-- CORS wired to `FRONTEND_ORIGIN`
-- Swagger UI at `/docs` in dev mode
-- `pyproject.toml` with all deps including `pgvector>=0.3.0`; ruff + mypy + pytest configured
-- Alembic initialized in `backend/alembic/` with `env.py` configured to:
-  - read sync URL from settings
-  - expose `Base.metadata` for autogenerate
-  - filter pre-existing enum types via `include_object`
-  - render `pgvector.sqlalchemy.Vector` columns via `render_item`
+- FastAPI + async SQLAlchemy 2 + asyncpg + Pydantic v2 + pgvector
+- `/health` endpoint live
+- Pydantic Settings reads `.env` (must run from `backend/`)
+- Alembic at revision `858813776375` (head)
+- 17 tables live in Supabase + alembic_version tracking
+- 11 Postgres enums, pgvector + HNSW index, pgcrypto + citext extensions
 
 ### Models (`backend/app/models/`)
-- 18 Python files: `base.py`, `enums.py`, `__init__.py`, plus 17 model files (one per table)
-- All 17 models register on `Base.metadata`
-- All SQLAlchemy relationships wired via `back_populates` on both sides
-- `configure_mappers()` runs cleanly with no errors
-- `pg_enum()` helper in `base.py` binds Python enums to existing Postgres enum types with `create_type=False` and `values_callable=lambda cls: [m.value for m in cls]`
-- Three Postgres reserved-name columns (`metadata` on `audit_logs`, `messages`, `embeddings`) use Python attribute name `extra_data` via `mapped_column("metadata", ...)` positional first arg
+- 17 models with full relationships
+- `pg_enum()` helper binds Python enums to existing Postgres enum types
+- Reserved-name columns (`metadata` on 3 tables) use `mapped_column("metadata", ...)` with Python attr name `extra_data`
 
-### Database (Supabase free tier)
-- Project: `tmndmosvvymncvvndyuy` (region: ap-southeast-1 / Singapore)
-- Extensions live: `pgcrypto 1.3`, `citext 1.6`, `vector 0.8.0`
-- Enums live (11 total): booking_status, business_status, conversation_channel, conversation_status, day_of_week, embedding_source_type, escalation_priority, escalation_status, message_role, payment_status, user_role
-- **Tables live (17):** audit_logs, bookings, business_settings, businesses, conversations, customers, embeddings, escalations, faqs, messages, operating_hours, payments, platform_settings, schedule_exceptions, services, users, webhook_events
-- Plus `alembic_version` table (Alembic-managed)
-- Alembic at revision `858813776375` (head)
-- HNSW cosine-similarity index on `embeddings.embedding`
-- Deferred FK `fk_bookings_conversation_id` installed after both tables exist (resolves circular dependency)
+### Auth (`backend/app/`)
+- **Security** (`app/core/security.py`) — JWT encode/decode, bcrypt direct (NOT passlib), TokenData Pydantic model
+- **Encryption** (`app/core/encryption.py`) — Fernet wrapper with module-level `platform_encryption` singleton
+- **Database** (`app/core/database.py`) — async engine configured for Supabase pooler, `get_db()` dependency
+- **Permissions** (`app/core/permissions.py`) — `get_current_user`, `require_super_admin`, `require_business_admin`, `get_business_id_filter`
+- **Schemas** (`app/schemas/auth.py`) — RegisterRequest, LoginRequest, UserOut, etc. with EmailStr validation
+- **Service** (`app/services/auth_service.py`) — HTTP-agnostic logic + 4 custom exceptions
+- **Router** (`app/routers/auth.py`) — 5 endpoints mounted at `/api/v1/auth`:
+  - `POST /register` — public, creates business + admin
+  - `POST /login` — public, sets cookies
+  - `POST /logout` — clears cookies (204)
+  - `POST /refresh` — uses refresh cookie, re-issues access cookie
+  - `GET /me` — JWT required, returns current user
+- httpOnly cookies, samesite=lax, secure flag only in prod/staging
 
-### Verify helper (`backend/scripts/verify_tables.py`)
-- Lists every table in the `public` schema. Run from `backend/`:
-  `.venv\Scripts\python scripts\verify_tables.py`
-- Should print 18 tables (17 + `alembic_version`)
+### Scripts (`backend/scripts/`)
+- `verify_tables.py` — list all tables (smoke test after migrations)
+- `verify_db_session.py` — async session roundtrip (smoke test)
+- `verify_demo_data.py` — row counts by entity
+- `create_super_admin.py` — bootstrap super admin (env or interactive). Idempotent: detects existing.
+- `seed_demo_data.py` — creates 3 demo businesses (Dhaka Dental, Quick HVAC, Rahman Law) with full setup. Idempotent.
+
+### Tests (`backend/tests/`)
+- `conftest.py` — fresh `AsyncEngine` per test (avoids closed-loop bugs), `unique_slug`/`unique_email` helpers
+- `test_auth.py` — 4 integration tests, all green:
+  1. register happy path → 201
+  2. login happy path → 200 + cookies set
+  3. /auth/me without auth → 401
+  4. `require_super_admin` invoked on business_admin → 403
+
+### Database state in Supabase
+- 1 super admin (you)
+- 4 businesses: `test-dental` (from manual Swagger testing) + `dhaka-dental` + `quick-hvac` + `rahman-law`
+- 4 business admins (one for test-dental, one per demo business)
+- 15 services, 21 operating hours rows, 30 FAQs
 
 ### Frontend (`frontend/`)
-- Next.js 16.2.4 + Turbopack + TypeScript strict + Tailwind v4 + App Router + `src/` dir + `@/*` alias
-- shadcn/ui initialized with `base-nova` preset, CSS variables on
-- Components installed: button, card, dialog, input, label, select, sonner, table
-- Libraries installed: `react-hook-form`, `@hookform/resolvers`, `zod`
-- `.env.local` and `.env.example` present, properly gitignored
-- `AGENTS.md` + `CLAUDE.md` in frontend/ — Next.js 16 scaffold warnings, kept intentionally
-
-### Docs
-- 9 planning docs in `docs/` (00–08)
-- `CLAUDE.md` at project root with full project briefing including Phase 1 status
-- This file (`docs/08-session-log.md`) tracking current session state
+- Next.js 16 + Tailwind v4 + shadcn/ui scaffold ready
+- No pages built yet (Phase 2 starts here)
 
 ---
 
 ## Decisions made that override the planning docs
 
-1. **Next.js 16, not 14.** The scaffold installed latest. Tailwind v4 (not v3). Treat `00-overview.md`'s "Next.js 14" as "Next.js 14+ / current stable."
+1. **Next.js 16, not 14.** Latest at scaffold time. Tailwind v4 (CSS-first config in `globals.css`).
 
-2. **Tailwind v4 config is CSS-first.** No `tailwind.config.ts` file — config lives in `src/app/globals.css` via `@theme` directive.
+2. **Supabase URL pattern (CRITICAL).**
+   - `DATABASE_URL` (async, FastAPI runtime) → **Transaction pooler**, port **6543**, `postgresql+asyncpg://`
+   - `DATABASE_URL_SYNC` (sync, Alembic) → **Session pooler**, port **5432**, `postgresql+psycopg2://`
+   - Pooler host: `aws-1-ap-southeast-2.pooler.supabase.com` (NOT `ap-southeast-1` — Supabase migrated the project's endpoint at some point; the actual working host is `ap-southeast-2`)
+   - Username format: `postgres.PROJECT_REF` (with the dot-ref suffix)
+   - Do NOT use "Direct connection" (`db.xxx.supabase.co:5432`) — IPv6-only on free tier
+   - **Async pooler config required** (see gotcha #11 below): `statement_cache_size=0` + randomized `prepared_statement_name_func`
 
-3. **Supabase connection URL pattern (CRITICAL).**
-   - `DATABASE_URL` (async, FastAPI runtime) → **Transaction pooler** at port 6543, driver `postgresql+asyncpg://`
-   - `DATABASE_URL_SYNC` (sync, Alembic) → **Session pooler** at port 5432, driver `postgresql+psycopg2://`
-   - Both go through `aws-0-ap-southeast-1.pooler.supabase.com`
-   - Username format: `postgres.PROJECT_REF` (with the dot-ref suffix) — required by pooler
-   - Do NOT use "Direct connection" (`db.xxx.supabase.co:5432`) — IPv6-only on free tier, fails DNS from Bangladesh.
+3. **bcrypt direct, not passlib.** passlib 1.7.4 is unmaintained and incompatible with bcrypt 5.x. `app/core/security.py` calls `bcrypt.gensalt(rounds=12)` / `bcrypt.checkpw` directly. pyproject.toml deps: `bcrypt>=4.0.0` (no passlib).
 
-4. **shadcn `form` component.** No standalone registry entry in current shadcn version. Have `react-hook-form` + `zod` installed. Create `form.tsx` wrapper manually in Phase 2 when first form is built.
+4. **`PLATFORM_ENCRYPTION_KEY` requires a real Fernet key**, not a placeholder. Generate via `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
 
-5. **shadcn `toast` is deprecated** → using `sonner`.
+5. **`pydantic[email]>=2.7.0`** in deps (not bare `pydantic`). Pydantic's `EmailStr` requires the optional `email-validator` package.
 
-6. **Python 3.11, not 3.12.** User prefers 3.11 for stability. `pyproject.toml` says `requires-python = ">=3.11"`.
+6. **Numbered enum names use SCREAMING_SNAKE_CASE in Python**, lowercase string values to match Postgres labels exactly.
 
-7. **Numbered enum names use SCREAMING_SNAKE_CASE in Python**, lowercase string values to match Postgres labels exactly. Bound via the `pg_enum()` helper.
+7. **Reserved column name `metadata`.** SQLAlchemy DeclarativeBase reserves `metadata`. On 3 tables (`audit_logs`, `messages`, `embeddings`), the Postgres column is forced via `mapped_column("metadata", JSONB, ...)` and the Python attribute is `extra_data`.
 
-8. **Reserved column name `metadata`.** Schema doc names the column `metadata` on three tables (`audit_logs`, `messages`, `embeddings`). SQLAlchemy's `DeclarativeBase` reserves `metadata` as a class attribute, so the Python attribute is `extra_data` and the Postgres column name is forced via the positional first arg: `mapped_column("metadata", JSONB, ...)`.
+8. **No `lazy=` relationship defaults.** Per-query `selectinload()` / `joinedload()` will be used when service-layer queries need it.
 
-9. **Models for `PlatformSetting`, `AuditLog`, `WebhookEvent` have NO `relationship(...)` calls.** They're either polymorphic (`AuditLog.entity_id`, `Embedding.source_id`) or singleton-ish (`PlatformSetting`, `WebhookEvent`) so traversal in Python isn't useful.
+9. **JWT subject is user UUID string** (immutable), not email. `role` and `business_id` travel as separate claims. Refresh tokens carry only `sub` — role/business_id are re-read from DB at refresh time.
 
-10. **No `lazy="selectin"` defaults on relationships.** Default loading strategy. Per-query `selectinload()` / `joinedload()` will be used when service-layer queries are written in later phases — gives per-query control and matches `docs/07-conventions.md`.
+10. **Cookie security flags depend on environment.** `secure=True` only when `ENVIRONMENT in {"prod", "staging"}`. Dev cookies must NOT be secure or browsers reject them over HTTP.
+
+11. **Test DB strategy:** Phase 1.8c tests use a fresh `AsyncEngine` per test (not the module-level engine) to avoid pytest-asyncio's closed-loop bug. Tests commit data; collision avoided via unique slugs/emails. A dedicated test schema is deferred to Phase 4+.
 
 ---
 
-## Gotchas discovered (avoid re-hitting)
+## Gotchas discovered (avoid re-hitting these)
 
-1. **pyproject.toml hatchling config** — must include `[tool.hatch.build.targets.wheel] packages = ["app"]` or editable install fails with "unable to determine which files to ship".
+1. **pyproject.toml hatchling config** must include `[tool.hatch.build.targets.wheel] packages = ["app"]` or editable install fails.
 
-2. **`.env` parsing** — duplicate-prefix typos (`KEY=KEY=value`) silently mangle config. Sanity-check loaded settings if they look wrong.
+2. **`.env` parsing** — duplicate-prefix typos (`KEY=KEY=value`) silently mangle config. Sanity-check loaded settings if values look wrong.
 
-3. **Secret exposure** — strict rule: **never print, log, or echo env var values**. Use masked prints only (scheme + host + port + `***`). Rotate any credential that has appeared in chat or logs.
+3. **Secret exposure** — never print env var values. Mask scheme + host + port + `***` for debugging. Rotate any credential that has appeared in chat or logs.
 
-4. **Supabase IPv6 issue** — see decision #3. If a connection error says "could not translate host name" on a `db.xxx.supabase.co` host → switch to pooler.
+4. **Supabase IPv6 issue** — direct (non-pooler) hostnames fail DNS from Bangladesh. Use the pooler.
 
-5. **Line ending warnings** (`LF will be replaced by CRLF`) — harmless on Windows, ignore.
+5. **`sa.Enum` ignores `create_type=False` inside `op.create_table`.** Use `postgresql.ENUM(...)` from the dialect-specific module instead. The PG dialect's ENUM honors the flag correctly. **Rule for all future migrations:** `from sqlalchemy.dialects import postgresql` and `postgresql.ENUM(values, name='...', create_type=False)`.
 
-6. **`sa.Enum` ignores `create_type=False` inside `op.create_table`.** When the bootstrap migration `8c5d604ee81d` created all 11 enum types, the Phase 1.4 migration's `op.create_table()` calls referenced them via `sa.Enum(name='...', create_type=False)`. SQLAlchemy ignored the flag and emitted `CREATE TYPE` via a `before_create` event hook → "type already exists" failure. **Fix:** use `postgresql.ENUM(...)` from the dialect-specific module instead — the PG dialect's ENUM honors `create_type=False` correctly. **Rule for all future migrations involving enums:** `from sqlalchemy.dialects import postgresql` and use `postgresql.ENUM(values, name='...', create_type=False)`. Document this in any new migration that touches enums.
+6. **Circular FK cycles need deferred constraint creation.** `bookings.conversation_id` ↔ `conversations.booking_id`. **Pattern in migration:** create one table without the offending FK, create the second, then `op.create_foreign_key(...)` after both exist. Mirror in `downgrade()`.
 
-7. **Circular FK cycles need deferred constraint creation.** `bookings.conversation_id` → `conversations.id` and `conversations.booking_id` → `bookings.id` form a cycle. Alembic autogenerate emits `SAWarning: Cannot correctly sort tables` and writes tables in alphabetical order, which fails because `bookings` references `conversations` before it exists. **Fix pattern in migration:** (a) create `bookings` without the `conversation_id` FK (column stays, FK constraint omitted from `ForeignKeyConstraint` list), (b) create `conversations` normally with its FK to `bookings.id` since `bookings` now exists, (c) at end of `upgrade()`, `op.create_foreign_key('fk_bookings_conversation_id', 'bookings', 'conversations', ['conversation_id'], ['id'], ondelete='SET NULL')`. In `downgrade()`, drop the deferred FK first via `op.drop_constraint('fk_bookings_conversation_id', 'bookings', type_='foreignkey')`, then drop tables in reverse dependency order.
+7. **Chat-to-terminal autolink corruption.** Filenames ending `.py` get auto-linkified by the chat UI. Copy-pasting can produce `verify_[tables.py](http://tables.py)` where `verify_tables.py` was meant. Disk and git history are USUALLY fine. Trust `git log --name-only` and import-test results, not shell display.
 
-8. **Chat-to-terminal autolink corruption.** Filenames ending in `.py` get auto-linkified by the chat UI's Markdown rendering. Copy-pasting a filename into PowerShell can result in `verify_[tables.py](http://tables.py)` arriving where `verify_tables.py` was meant. Symptoms: bracket-laden errors, `findstr: Cannot open` errors, weird `Cannot find drive` errors. **Disk and git history are usually fine** — the corruption is in transit, not on disk. **Workarounds:** type filenames manually, use PowerShell tab completion (`scripts\v` + Tab), check ground truth via `git log --name-only` (which doesn't autolink), or use VS Code's file explorer for renames.
+8. **`alembic check` exits non-zero when schema is out of sync.** Intentional. "FAILED" just means autogenerate sees pending changes.
 
-9. **`alembic check` exits non-zero when schema is out of sync.** This is intentional and correct — the command exists to detect drift. "FAILED: New upgrade operations detected" simply means autogenerate sees changes that need a new migration. Not an error in the configuration sense.
+9. **Alembic autogenerate drops DESC ordering on indexes.** Always grep generated migrations for `_desc` and verify they use `sa.literal_column('created_at DESC')`.
 
-10. **Alembic autogenerate drops DESC ordering on indexes.** When a model declares `Index('foo', text('created_at DESC'))`, autogenerate sometimes renders the index as `['created_at']` (no DESC) in the migration. Always grep generated migrations for index names ending in `_desc` and verify the migration uses `sa.literal_column('created_at DESC')`. We patched `ix_audit_logs_created_at_desc` manually in `3de3f91`.
+10. **passlib 1.7.4 is incompatible with bcrypt 5.x.** passlib reads `bcrypt.__about__.__version__` which the newer bcrypt removed; then falls back to a self-test that hits a 72-byte limit. **Fix:** drop passlib, use bcrypt directly. Schema unchanged (bcrypt hashes are bcrypt hashes).
+
+11. **asyncpg + Supabase transaction pooler require `statement_cache_size=0` + randomized `prepared_statement_name_func`.** Otherwise prepared-statement names like `__asyncpg_stmt_1__` collide across pooled connections (DuplicatePreparedStatementError). Both flags are set in `app/core/database.py` `create_async_engine` connect_args.
+
+12. **Supabase free tier projects pause after inactivity.** Symptom: `asyncpg.exceptions.InternalServerError: tenant/user postgres.<ref> not found`. Fix: open the Supabase dashboard and click "Restore project". Takes ~1 minute to wake.
+
+13. **`PLATFORM_ENCRYPTION_KEY` must be a real Fernet key.** If `.env` has the placeholder, `app/core/encryption.py` will raise `EncryptionError` at module import. Generate via `Fernet.generate_key().decode()`.
+
+14. **All `python -c` checks must run from `backend/`.** Pydantic Settings discovers `.env` relative to cwd. Running from repo root makes Python see no env vars and crash with "Field required" for every config field.
+
+15. **pytest-asyncio + module-level async engine = "Event loop is closed".** Each test gets a fresh event loop, but the engine's pool keeps connections bound to previous (now-closed) loops. **Fix:** create a fresh `AsyncEngine` per test in `conftest.py`, dispose at teardown. Do NOT use the module-level `engine` from `app.core.database` directly in tests.
+
+16. **Pydantic `EmailStr` requires email-validator.** Without it, schema modules fail at import with `ImportError: email-validator is not installed`. Declare `pydantic[email]` in pyproject.toml deps.
+
+17. **Never paste real credentials into chat.** Even local-dev creds. Conversation logs, screenshots, and training pipelines may retain them. Treat the chat like a public forum.
 
 ---
 
 ## Workflow established (keep this going)
 
 - **🤖 Claude Code** → ONLY file creation and code editing. No shell commands.
-- **👤 User runs in terminal** → ALL shell commands (git, pip, alembic, uvicorn, pnpm, etc.) by copy-paste from web-chat Claude's messages.
-- **👤 User handles** → third-party dashboards (Supabase, etc.), pasting secrets into `.env`, final review decisions.
-- **One step at a time.** Small steps with clear copy-paste commands, not long combined instructions.
-- **Sub-phase sized commits.** Each Phase 1 sub-phase (1.1, 1.2, 1.3a, 1.3b, 1.3c, 1.3d, 1.4a, 1.4b/c, 1.4d) is its own commit. Easy to revert, easy to review.
-- **Verify before committing.** After every Claude Code edit, run a small Python check (`from app.models import Base; print(...)`) or an Alembic command to confirm the change actually works before staging.
+- **👤 User runs in terminal** → ALL shell commands (git, pip, alembic, uvicorn, pnpm, pytest, etc.) by copy-paste from web-chat Claude's messages.
+- **👤 User handles** → third-party dashboards (Supabase, Stripe, Vapi), pasting secrets into `.env`, final review decisions, password rotation.
+- **One step at a time.** Small steps with clear copy-paste commands.
+- **Sub-phase sized commits.** Each Phase 1 sub-phase was its own commit. Easy to revert/review.
+- **Verify before committing.** Quick Python or pytest check after each Claude Code edit confirms it works.
 
 ---
 
-## What's next — Phase 1.5
+## What's next — Phase 2
 
-Per `docs/05-build-phases.md`:
+Per `docs/05-build-phases.md` — 4–5 days.
 
-- **Phase 1.5** — Security utilities
-  - `app/core/security.py`: JWT encode/decode, bcrypt password hash + verify, `get_current_user` dependency
-  - `app/core/encryption.py`: Fernet wrapper around `PLATFORM_ENCRYPTION_KEY` for `platform_settings.value_encrypted` and `business_settings.custom_api_key_encrypted`
-- **Phase 1.6** — Permission dependencies
-  - `app/core/permissions.py`: `require_super_admin`, `require_business_admin`, `require_business_admin_for_self_or_super_admin`
-- **Phase 1.7** — Auth endpoints per `docs/03-api.md` section 1
-  - `POST /auth/register`, `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`, `POST /auth/refresh`
-  - httpOnly cookies, JWT in `access_token`, refresh in `refresh_token`
-- **Phase 1.8** — Bootstrap + seed + tests
-  - `scripts/create_super_admin.py` — interactive (or env-driven) super admin creation
-  - `scripts/seed_demo_data.py` — 3 demo businesses (Dental, HVAC, Law), 5 services each, 7 days of hours, 10 FAQs each, 1 business admin per business
-  - 4 integration tests: register, login, 401 on protected route without auth, 403 on wrong role
+**Goal:** Business admin logs in, sees a dashboard, can CRUD services and hours.
 
-Phase 1 done-when conditions:
-- All 17 tables exist in Supabase ✅ DONE
-- `POST /auth/login` with seeded business admin returns JWT cookie
-- `GET /auth/me` with that cookie returns user + role
-- Calling a business admin route as non-admin returns 403
-- 4 integration tests green
+**Backend tasks:**
+1. `routers/admin/business.py` — GET/PATCH business, PATCH settings, POST logo upload
+2. `routers/admin/services.py` — full CRUD. Skip embedding sync (stub).
+3. `routers/admin/hours.py` — GET/PUT operating hours, exceptions CRUD
+4. `routers/admin/faqs.py` — CRUD. Skip embedding sync.
+5. `integrations/supabase_storage.py` — image upload helper
+6. Integration tests for services CRUD (create, list, update, delete, scope enforcement)
+
+**Frontend tasks:**
+1. `app/(public)/login/page.tsx` + Zustand auth store
+2. `lib/api/client.ts` — fetch wrapper with cookies, error normalization
+3. `components/layout/admin-sidebar.tsx` + admin auth guard layout
+4. `app/admin/page.tsx` — dashboard shell with stat placeholders
+5. `app/admin/services/page.tsx` + `[id]/page.tsx` — services CRUD UI
+6. `app/admin/hours/page.tsx` — 7-day editor
+7. `app/admin/faqs/page.tsx` — FAQ CRUD UI
+8. `app/admin/settings/page.tsx` — business info, logo upload
+
+**Done when:**
+- Login as `owner@dhakadental.com` (password `demo1234`) → see sidebar → click Services → see 5 seeded services → edit one → see change persist
+- Edit hours → see change in Supabase
+- Upload logo → see it on dashboard
+
+Phase 2 sub-phase plan (to be confirmed at start):
+- **2.1** — backend admin/business + admin/services CRUD + tests
+- **2.2** — backend admin/hours + admin/faqs CRUD + tests
+- **2.3** — Supabase storage integration for logos
+- **2.4** — frontend auth store + login page + protected layout
+- **2.5** — frontend services + hours + faqs pages
+- **2.6** — frontend settings + dashboard shell
 
 ---
 
 ## Resume instructions for next Claude chat
 
 1. Read `CLAUDE.md` at project root
-2. Read all 9 files in `docs/` (especially this one — it's the freshest state)
+2. Read all 9 files in `docs/`, especially this one
 3. Confirm understanding by summarizing:
-   - Current state: Phase 1.1–1.4 done, all 17 tables live in Supabase, Alembic at `858813776375 (head)`. Phase 1.5 next.
-   - The Supabase URL pattern (pooler, not direct).
-   - The workflow rules (Claude Code for files only, user runs commands).
-   - Three critical gotchas to keep in mind: `postgresql.ENUM` for migration enums (not `sa.Enum`); deferred FK pattern for bookings↔conversations cycle; chat autolink trap on `.py` filenames.
-4. Ask user to say "start Phase 1.5" when ready
-5. Begin with Phase 1.5 — small commit-sized chunks, one at a time
+   - Current state: Phase 1 complete; auth tested end-to-end; 1 super admin + 4 businesses + demo data in Supabase. Phase 2 next.
+   - Supabase URL pattern: pooler at `aws-1-ap-southeast-2`, async port 6543, `statement_cache_size=0`.
+   - The 17 gotchas — especially: `postgresql.ENUM` (not `sa.Enum`); bcrypt direct (not passlib); fresh engine per test; never paste creds.
+4. Wait for the user to say "start Phase 2.1" before producing prompts.
