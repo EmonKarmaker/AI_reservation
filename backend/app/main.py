@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers.admin.business import router as admin_business_router
+from app.routers.admin.faqs import router as admin_faqs_router
+from app.routers.admin.hours import router as admin_hours_router
 from app.routers.admin.services import router as admin_services_router
 from app.routers.auth import router as auth_router
 
@@ -27,6 +29,8 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(admin_business_router, prefix="/api/v1")
     app.include_router(admin_services_router, prefix="/api/v1")
+    app.include_router(admin_hours_router, prefix="/api/v1")
+    app.include_router(admin_faqs_router, prefix="/api/v1")
 
     app.add_middleware(
         CORSMiddleware,
