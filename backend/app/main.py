@@ -7,6 +7,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.routers.admin.business import router as admin_business_router
+from app.routers.admin.services import router as admin_services_router
 from app.routers.auth import router as auth_router
 
 logger = logging.getLogger(__name__)
@@ -23,6 +25,8 @@ def create_app() -> FastAPI:
     # Mount routers. Public, business-admin, and super-admin routers will follow
     # the same /api/v1 prefix per docs/03-api.md.
     app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(admin_business_router, prefix="/api/v1")
+    app.include_router(admin_services_router, prefix="/api/v1")
 
     app.add_middleware(
         CORSMiddleware,
