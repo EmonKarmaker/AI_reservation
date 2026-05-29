@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
 
 from app.config import settings
 
@@ -28,38 +29,24 @@ from app.config import settings
 # Engine
 # ---------------------------------------------------------------------------
 
-# Notes on the configuration:
+# Use NullPool so SQLAlchemy does NOT pool asyncpg connections itself.
+# Supabase's pgbouncer (transaction pool mode) is already pooling connections
+# on the server side, and reusing asyncpg connections through pgbouncer in
+# transaction mode causes prepared-statement-name collisions
+# (InvalidSQLStatementNameError) once the engine has served more than one
+# request. With NullPool, each request opens a fresh asyncpg connection
+# through pgbouncer and closes it at end of request, so prepared statements
+# never outlive a single transaction.
 #
-# - ``pool_pre_ping=True``: Supabase free tier pauses idle databases. Pre-ping
-#   issues a no-op SELECT 1 before handing out a pooled connection so we
-#   detect dead connections gracefully instead of failing the user's request.
-#
-# - ``pool_size`` / ``max_overflow``: modest defaults that fit free hosting.
-#   Render free tier has limited concurrent worker capacity anyway. Tune later.
-#
-# - ``echo``: log all SQL when in dev. Off in staging/prod.
-#
-# - ``connect_args`` for asyncpg + Supabase pgbouncer transaction pooler:
-#   pgbouncer in transaction mode does not pin a backend connection to a
-#   client session, so prepared statements cannot be reused across queries.
-#   asyncpg by default caches prepared statements and reuses fixed names like
-#   ``__asyncpg_stmt_1__``, which collide on the next pooled connection
-#   (DuplicatePreparedStatementError). Two settings prevent this:
-#     * ``statement_cache_size=0`` — disable client-side prepared-statement
-#       caching. Tiny perf cost; correctness with the pooler.
-#     * ``prepared_statement_name_func`` — randomize statement names so even
-#       transient statements never collide across pooled connections.
-import uuid as _uuid
-
+# We still set statement_cache_size=0 as a belt-and-suspenders measure;
+# asyncpg's per-connection cache is irrelevant when each connection is short
+# lived, but explicit > implicit.
 engine: AsyncEngine = create_async_engine(
     settings.DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
+    poolclass=NullPool,
     echo=(settings.ENVIRONMENT == "dev"),
     connect_args={
         "statement_cache_size": 0,
-        "prepared_statement_name_func": lambda: f"__asyncpg_{_uuid.uuid4()}__",
     },
 )
 
