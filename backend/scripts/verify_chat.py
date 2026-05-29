@@ -27,8 +27,10 @@ DHAKA_DENTAL_ID = UUID("dc37dd35-bc92-4e6e-bce1-596b01a17a42")
 CUSTOMER_ID = uuid4()
 
 TURNS = [
-    "How much does a routine cleaning cost?",
-    "Great, can I book one for Saturday morning?",  # depends on history
+    "How much does a routine cleaning cost?",                # expect: question
+    "Great, can I book one for Saturday morning?",            # expect: booking
+    "This is ridiculous, I want to speak to a manager!",      # expect: escalate
+    "What are your hours on Sunday?",                         # expect: question
 ]
 
 
@@ -52,9 +54,11 @@ async def main() -> None:
                 business_greeting=business.ai_greeting,
                 business_personality=business.ai_personality,
             )
+            print(f"  intent: {state.intent}")
             print(f"  conversation_id: {state.conversation_id}")
             print(f"  history loaded: {len(state.history)} prior messages")
-            print(f"  retrieved: {len(state.retrieved_chunks)} chunks")
+            if state.retrieved_chunks:
+                print(f"  retrieved: {len(state.retrieved_chunks)} chunks")
             print(f"AI: {state.assistant_message}\n")
 
 

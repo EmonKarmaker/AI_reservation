@@ -1,30 +1,26 @@
-"""Minimal LangGraph chat receptionist (Phase 4.3 — 3 nodes only).
+"""LangGraph chat receptionist (Phase 4.5 — intent-routed).
 
-This is the foundation. Phase 4.5+ will expand this graph with intent
-classification, booking flow, and escalation. For now we deliver the
-simplest viable Q&A bot:
+Graph layout:
 
-    entry → retrieve → answer → END
+    load_history → classify_intent → [router] → one of:
+        question  → retrieve → answer
+        booking   → booking_stub
+        escalate  → escalate_stub
+    → save_turn → END
 
-State carries the user's message, the retrieved RAG chunks, and the
-assistant's reply. The graph is async end-to-end (Groq + pgvector are both
-async-only) and returns a complete final state on each invocation.
+Multi-tenancy: business_id is REQUIRED in state. retrieve_relevant filters
+by it and the system prompt tells the LLM to ground on the provided context
+only.
 
-Multi-tenancy: business_id is REQUIRED in state. retrieve_relevant filters by
-it, and the system prompt explicitly tells the LLM to only answer based on
-the provided context. There is no path through this graph that lets the
-chatbot see another tenant's data.
-
-Why we use a graph at all for 3 nodes: it's the foundation. Phase 4.5
-introduces a router node that branches between question-answering and the
-booking flow, and that's exactly the kind of thing LangGraph is for. Building
-it as a graph from day one keeps the API stable across phases.
+Async end-to-end (Groq + pgvector are async-only). Compiled graph is a
+module-level singleton; only per-request state is fresh.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,6 +39,13 @@ from app.services.rag import RetrievedChunk, retrieve_relevant
 logger = logging.getLogger(__name__)
 
 
+# Intent labels. Stable, short. Adding more later means updating: (a) the
+# classifier prompt, (b) _parse_intent, (c) _route_by_intent.
+Intent = Literal["question", "booking", "escalate"]
+INTENT_VALUES: tuple[Intent, ...] = ("question", "booking", "escalate")
+DEFAULT_INTENT: Intent = "question"
+
+
 # ---------------------------------------------------------------------------
 # State schema
 # ---------------------------------------------------------------------------
@@ -52,22 +55,17 @@ class ChatState:
     """State carried across all graph nodes.
 
     Required inputs:
-    - ``db``           : Active async session.
-    - ``business_id``  : Tenant whose embeddings to search.
-    - ``business_name``: Used in the system prompt.
-    - ``customer_id``  : Identifies the chat session. The frontend generates
-                         this per-browser; for now any stable UUID works.
-    - ``user_message`` : The customer's latest message.
+    - db, business_id, business_name, customer_id, user_message
 
     Optional inputs:
-    - ``business_greeting``    : The business's configured AI greeting.
-    - ``business_personality`` : The business's configured AI personality.
+    - business_greeting, business_personality
 
-    Populated by graph execution:
-    - ``conversation_id``  : The conversation row id (loaded by 'load_history').
-    - ``history``          : Prior messages, oldest first (loaded by 'load_history').
-    - ``retrieved_chunks`` : RAG results (loaded by 'retrieve').
-    - ``assistant_message``: Final LLM reply (loaded by 'answer').
+    Filled by nodes:
+    - conversation_id (load_history)
+    - history (load_history)
+    - intent (classify_intent)
+    - retrieved_chunks (retrieve, question branch only)
+    - assistant_message (answer / booking_stub / escalate_stub)
     """
 
     # Required inputs
@@ -84,6 +82,7 @@ class ChatState:
     # Filled by nodes
     conversation_id: UUID | None = None
     history: list[Message] = field(default_factory=list)
+    intent: Intent = DEFAULT_INTENT
     retrieved_chunks: list[RetrievedChunk] = field(default_factory=list)
     assistant_message: str = ""
 
@@ -111,6 +110,101 @@ async def load_history_node(state: ChatState) -> dict:
     return {"conversation_id": conversation.id, "history": history}
 
 
+# --- Intent classification -------------------------------------------------
+
+_INTENT_SYSTEM_PROMPT = """You classify the customer's MOST RECENT message in \
+a chat with an AI receptionist for a small business.
+
+Output EXACTLY one word, one of: question, booking, escalate
+
+Definitions:
+- booking   -> the customer wants to BOOK, RESERVE, SCHEDULE, CANCEL, or \
+RESCHEDULE an appointment. Verbs like "book", "schedule", "reserve", "make an \
+appointment", "set up", or any confirmation like "yes" or "sure" after the AI \
+offered to schedule something.
+- escalate  -> the customer is angry, frustrated, demanding a manager/human, \
+making a complaint, or describing an emergency.
+- question  -> EVERYTHING ELSE. Asking about prices, services, hours, \
+policies, locations, or any informational query.
+
+Examples:
+
+Customer: "How much does a cleaning cost?"
+Label: question
+
+Customer: "Can I book an appointment for Saturday?"
+Label: booking
+
+Customer: "I'd like to schedule a checkup."
+Label: booking
+
+Customer: "Great, can I book one for Saturday morning?"
+Label: booking
+
+Customer: "Yes, please book it."
+Label: booking
+
+Customer: "What time do you close?"
+Label: question
+
+Customer: "Do you take walk-ins?"
+Label: question
+
+Customer: "I want to cancel my appointment."
+Label: booking
+
+Customer: "This is ridiculous, I want a manager!"
+Label: escalate
+
+Customer: "I've been waiting 30 minutes, this is unacceptable."
+Label: escalate
+
+Respond with the single label word only. No explanation, no punctuation."""
+
+
+def _parse_intent(raw: str) -> Intent:
+    """Parse LLM output into a known Intent label. Falls back to DEFAULT_INTENT."""
+    candidate = raw.strip().lower().rstrip(".").strip("'\"")
+    if candidate not in INTENT_VALUES:
+        first = candidate.split()[0] if candidate else ""
+        candidate = first
+    if candidate in INTENT_VALUES:
+        return candidate  # type: ignore[return-value]
+    return DEFAULT_INTENT
+
+
+async def classify_intent_node(state: ChatState) -> dict:
+    """Classify the customer's intent using the fast Groq model."""
+    from app.config import settings
+
+    messages: list[dict] = [{"role": "system", "content": _INTENT_SYSTEM_PROMPT}]
+
+    # Include up to last 4 prior turns for context. Enough to disambiguate
+    # "yes" or "sure" without drowning out the current message.
+    for m in state.history[-4:]:
+        if m.role in (MessageRole.USER, MessageRole.ASSISTANT):
+            messages.append({"role": m.role.value, "content": m.content})
+
+    messages.append({"role": "user", "content": state.user_message})
+
+    try:
+        raw = await chat_completion(
+            messages,
+            model=settings.GROQ_MODEL_SMART,
+            temperature=0.0,
+            max_tokens=10,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Intent classifier failed: %s — defaulting to %s", exc, DEFAULT_INTENT)
+        return {"intent": DEFAULT_INTENT}
+
+    intent = _parse_intent(raw)
+    logger.info("Classified intent: %s (raw=%r)", intent, raw[:30])
+    return {"intent": intent}
+
+
+# --- Retrieval (question branch) -------------------------------------------
+
 async def retrieve_node(state: ChatState) -> dict:
     """Retrieve top-k relevant embeddings for the user's message."""
     chunks = await retrieve_relevant(
@@ -128,18 +222,10 @@ async def retrieve_node(state: ChatState) -> dict:
     return {"retrieved_chunks": chunks}
 
 
+# --- Answer (question branch) ----------------------------------------------
+
 def _build_system_prompt(state: ChatState) -> str:
-    """Compose the system prompt with business info + retrieved context.
-
-    The system prompt does three things:
-    1. Sets identity (the AI works for this specific business).
-    2. Encodes the business's configured personality + greeting style.
-    3. Provides the retrieved chunks as ground truth, with explicit
-       instructions not to fabricate beyond them.
-
-    This is the most important prompt in the whole system. Phase 4.5+ will
-    extend it but the spine stays the same.
-    """
+    """Compose system prompt with business identity + personality + RAG context."""
     parts: list[str] = []
 
     parts.append(
@@ -178,14 +264,13 @@ async def answer_node(state: ChatState) -> dict:
 
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
-    # Replay prior turns. Filter out anything that isn't user/assistant — the
-    # OpenAI-style schema rejects unknown roles, and there's no point
-    # forwarding tool/system messages from earlier turns to a fresh prompt.
+    # Replay prior turns. Filter out non-user/assistant roles — the OpenAI
+    # schema rejects unknown ones, and there's no point forwarding tool/system
+    # messages from earlier turns to a fresh prompt.
     for m in state.history:
         if m.role in (MessageRole.USER, MessageRole.ASSISTANT):
             messages.append({"role": m.role.value, "content": m.content})
 
-    # The new user message comes last so the model knows what to respond to.
     messages.append({"role": "user", "content": state.user_message})
 
     try:
@@ -200,12 +285,42 @@ async def answer_node(state: ChatState) -> dict:
     return {"assistant_message": reply}
 
 
+# --- Booking + escalate stubs (replaced in Phase 4.6/4.8) -----------------
+
+async def booking_stub_node(state: ChatState) -> dict:
+    """Polite deferral for booking requests. Phase 4.6 replaces this."""
+    reply = (
+        f"I'd love to help you book that. Let me hand you to the {state.business_name} "
+        "team — they'll reach out to confirm the details. In the meantime, can I "
+        "answer any other questions?"
+    )
+    return {"assistant_message": reply}
+
+
+async def escalate_stub_node(state: ChatState) -> dict:
+    """Acknowledge an escalation request. Phase 4.8 adds the email."""
+    logger.info(
+        "Escalation triggered for business=%s, customer=%s, message=%r",
+        state.business_id,
+        state.customer_id,
+        state.user_message[:80],
+    )
+    reply = (
+        f"I understand — let me get a human from the {state.business_name} team "
+        "involved right away. They'll be in touch shortly. Is there anything "
+        "urgent I should pass along?"
+    )
+    return {"assistant_message": reply}
+
+
+# --- Persistence (all branches) --------------------------------------------
+
 async def save_turn_node(state: ChatState) -> dict:
     """Persist the user message and the AI reply.
 
-    Runs LAST so a failure here doesn't poison the in-memory state. If
-    persistence fails we still return a usable assistant_message to the
-    caller; the conversation just won't be re-readable later.
+    Best-effort: a failure here doesn't poison the in-memory state. Caller
+    still gets a usable assistant_message; the conversation just won't be
+    re-readable later if persistence broke.
     """
     if state.conversation_id is None:
         logger.warning("save_turn_node: no conversation_id; skipping persistence")
@@ -234,41 +349,56 @@ async def save_turn_node(state: ChatState) -> dict:
 # Graph construction
 # ---------------------------------------------------------------------------
 
-def build_chat_graph():
-    """Construct the 4-node graph:
-        load_history → retrieve → answer → save_turn → END.
+def _route_by_intent(state: ChatState) -> str:
+    """Map intent → next node name for the conditional edge."""
+    if state.intent == "booking":
+        return "booking_stub"
+    if state.intent == "escalate":
+        return "escalate_stub"
+    return "retrieve"
 
-    Compiled once, reused for every request.
-    """
+
+def build_chat_graph():
+    """Construct the intent-routed chat graph."""
     from langgraph.graph import END, START, StateGraph
 
     graph = StateGraph(ChatState)
 
     graph.add_node("load_history", load_history_node)
+    graph.add_node("classify_intent", classify_intent_node)
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("answer", answer_node)
+    graph.add_node("booking_stub", booking_stub_node)
+    graph.add_node("escalate_stub", escalate_stub_node)
     graph.add_node("save_turn", save_turn_node)
 
     graph.add_edge(START, "load_history")
-    graph.add_edge("load_history", "retrieve")
+    graph.add_edge("load_history", "classify_intent")
+
+    graph.add_conditional_edges(
+        "classify_intent",
+        _route_by_intent,
+        {
+            "retrieve": "retrieve",
+            "booking_stub": "booking_stub",
+            "escalate_stub": "escalate_stub",
+        },
+    )
+
     graph.add_edge("retrieve", "answer")
     graph.add_edge("answer", "save_turn")
+    graph.add_edge("booking_stub", "save_turn")
+    graph.add_edge("escalate_stub", "save_turn")
     graph.add_edge("save_turn", END)
 
     return graph.compile()
 
 
-# Module-level compiled graph. Recompiling per request is fine perf-wise but
-# wasteful; cache it.
 _compiled_graph = None
 
 
 def get_chat_graph():
-    """Lazy singleton accessor for the compiled graph.
-
-    Why lazy: langgraph imports torch transitively in some configs, so we
-    only pay the cold-start cost when something actually wants the chat.
-    """
+    """Lazy singleton accessor for the compiled graph."""
     global _compiled_graph
     if _compiled_graph is None:
         _compiled_graph = build_chat_graph()
@@ -289,11 +419,7 @@ async def run_chat_turn(
     business_greeting: str | None = None,
     business_personality: str | None = None,
 ) -> ChatState:
-    """Run one user message through the graph and return the final state.
-
-    Returns the FINAL state. Callers read ``state.assistant_message`` for the
-    reply and ``state.conversation_id`` if they need to reference the row.
-    """
+    """Run one user message through the graph and return the final state."""
     graph = get_chat_graph()
 
     initial_state = ChatState(
@@ -320,6 +446,7 @@ async def run_chat_turn(
         business_personality=business_personality,
         conversation_id=result.get("conversation_id"),
         history=result.get("history", []),
+        intent=result.get("intent", DEFAULT_INTENT),
         retrieved_chunks=result.get("retrieved_chunks", []),
         assistant_message=result.get("assistant_message", ""),
     )
