@@ -17,6 +17,7 @@ from app.core.permissions import get_business_id_filter, require_business_admin
 from app.models.faq import Faq
 from app.models.user import User
 from app.schemas.hours_faqs import FaqCreate, FaqOut, FaqUpdate
+from app.services.embedding_sync import delete_faq_embedding, sync_faq_embedding
 
 
 router = APIRouter(prefix="/admin/faqs", tags=["admin:faqs"])
@@ -75,7 +76,7 @@ async def create_faq(
     db.add(faq)
     await db.commit()
     await db.refresh(faq)
-    # TODO(phase-3): trigger embedding sync for this FAQ
+    await sync_faq_embedding(db, faq)
     return faq
 
 
@@ -107,7 +108,7 @@ async def update_faq(
         setattr(faq, field, value)
     await db.commit()
     await db.refresh(faq)
-    # TODO(phase-3): re-trigger embedding sync for this FAQ
+    await sync_faq_embedding(db, faq)
     return faq
 
 
@@ -121,7 +122,8 @@ async def delete_faq(
 ) -> None:
     target = await _resolve_business_id(business_id_filter, business_id)
     faq = await _get_owned_faq(db, faq_id, target)
+    faq_id_for_embedding = faq.id
     await db.delete(faq)
     await db.commit()
-    # TODO(phase-3): remove embedding for this FAQ
+    await delete_faq_embedding(db, faq_id_for_embedding)
     return None

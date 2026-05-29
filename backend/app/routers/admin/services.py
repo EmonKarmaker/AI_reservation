@@ -20,6 +20,10 @@ from app.core.permissions import get_business_id_filter, require_business_admin
 from app.models.service import Service
 from app.models.user import User
 from app.schemas.business import ServiceCreate, ServiceOut, ServiceUpdate
+from app.services.embedding_sync import (
+    delete_service_embedding,
+    sync_service_embedding,
+)
 
 
 router = APIRouter(prefix="/admin/services", tags=["admin:services"])
@@ -92,7 +96,7 @@ async def create_service(
     db.add(service)
     await db.commit()
     await db.refresh(service)
-    # TODO(phase-3): trigger embedding sync for this service
+    await sync_service_embedding(db, service)
     return service
 
 
@@ -126,7 +130,7 @@ async def update_service(
 
     await db.commit()
     await db.refresh(service)
-    # TODO(phase-3): re-trigger embedding sync for this service
+    await sync_service_embedding(db, service)
     return service
 
 
@@ -142,5 +146,5 @@ async def delete_service(
     service = await _get_owned_service(db, service_id, target)
     service.deleted_at = datetime.now(tz=timezone.utc)
     await db.commit()
-    # TODO(phase-3): remove embedding for this service
+    await delete_service_embedding(db, service.id)
     return None
