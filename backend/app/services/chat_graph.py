@@ -25,7 +25,11 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy import select
+
 from app.integrations.llm import chat_completion
+from app.integrations.resend_email import EmailError, send_email
+from app.models.business_setting import BusinessSetting
 from app.models.enums import MessageRole
 from app.models.message import Message
 from app.services.conversation_store import (
@@ -297,14 +301,123 @@ async def booking_stub_node(state: ChatState) -> dict:
     return {"assistant_message": reply}
 
 
+def _format_escalation_email(state: ChatState) -> tuple[str, str]:
+    """Compose (subject, html) for the escalation email.
+
+    Includes the triggering message, the customer_id, and the last 6 turns
+    of conversation so the human responder has context.
+    """
+    subject = f"[Chat escalation] {state.business_name} — customer needs help"
+
+    # Render last 6 turns as a simple HTML transcript.
+    transcript_rows: list[str] = []
+    for m in state.history[-6:]:
+        role_label = m.role.value if hasattr(m.role, "value") else str(m.role)
+        # Light XSS guard: replace angle brackets. The recipient is the
+        # business owner so the risk is low, but emails get forwarded,
+        # archived, sometimes rendered in surprising places.
+        safe_content = (
+            m.content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )
+        transcript_rows.append(
+            f"<p><strong>{role_label.title()}:</strong> {safe_content}</p>"
+        )
+    transcript_html = "\n".join(transcript_rows) if transcript_rows else (
+        "<p><em>(no prior messages)</em></p>"
+    )
+
+    triggering = (
+        state.user_message.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+    html = f"""\
+<h2>A customer needs human help</h2>
+
+<p>The AI receptionist for <strong>{state.business_name}</strong> escalated
+the following conversation. The customer is anonymous (web chat); use the
+customer_id below if you need to look them up.</p>
+
+<h3>Triggering message</h3>
+<blockquote>{triggering}</blockquote>
+
+<h3>Recent conversation</h3>
+{transcript_html}
+
+<hr/>
+<p style="color:#666;font-size:12px">
+customer_id: {state.customer_id}<br/>
+conversation_id: {state.conversation_id}
+</p>
+"""
+    return subject, html
+
+
+async def _fetch_escalation_email(state: ChatState) -> str | None:
+    """Look up the business's configured escalation email. None if not set."""
+    result = await state.db.execute(
+        select(BusinessSetting.escalation_email).where(
+            BusinessSetting.business_id == state.business_id
+        )
+    )
+    row = result.scalar_one_or_none()
+    # CITEXT column may return None or the empty string; normalise both.
+    if row:
+        stripped = row.strip()
+        if stripped:
+            return stripped
+    return None
+
+
 async def escalate_stub_node(state: ChatState) -> dict:
-    """Acknowledge an escalation request. Phase 4.8 adds the email."""
+    """Acknowledge an escalation request and send a notification email.
+
+    Best-effort: any failure (no escalation_email configured, Resend down,
+    network failure) is logged but does NOT break the chat reply. The
+    customer always gets an acknowledgment.
+
+    Phase 4.8: real email via Resend. The recipient is the business's
+    ``business_settings.escalation_email``.
+    """
     logger.info(
         "Escalation triggered for business=%s, customer=%s, message=%r",
         state.business_id,
         state.customer_id,
         state.user_message[:80],
     )
+
+    # Best-effort: fetch the configured escalation_email + send. Catches
+    # everything — the chatbot reply must NOT depend on the email landing.
+    try:
+        recipient = await _fetch_escalation_email(state)
+        if recipient is None:
+            logger.info(
+                "No escalation_email configured for business=%s; skipping send",
+                state.business_id,
+            )
+        else:
+            subject, html = _format_escalation_email(state)
+            message_id = await send_email(to=recipient, subject=subject, html=html)
+            logger.info(
+                "Escalation email sent to %s (resend message_id=%s) for business=%s",
+                recipient,
+                message_id,
+                state.business_id,
+            )
+    except EmailError as exc:
+        logger.warning(
+            "Failed to send escalation email for business=%s: %s",
+            state.business_id,
+            exc,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive: never break the chat
+        logger.warning(
+            "Unexpected error in escalation flow for business=%s: %s",
+            state.business_id,
+            exc,
+        )
+
     reply = (
         f"I understand — let me get a human from the {state.business_name} team "
         "involved right away. They'll be in touch shortly. Is there anything "

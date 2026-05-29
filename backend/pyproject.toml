@@ -11,6 +11,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "groq>=0.13.0",
     "langgraph>=0.2.0",
+    "resend>=2.0.0",
     "sentence-transformers>=3.0.0",
 
     # Database
