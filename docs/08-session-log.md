@@ -1,4 +1,4 @@
-# Session Log — Phase 1 Complete; Phase 2 Next
+# Session Log — Phases 0-3 Complete; Phase 4 In Progress (4.1-4.5, 4.7 done; 4.6 + 4.8 pending)
 
 ## What this document is
 This is the **handoff state** of the AI Reservation SaaS project. New Claude chats should read this after `CLAUDE.md` and the other 8 docs in `docs/`. It captures what's done, what decisions override the planning docs, and what's next.
@@ -8,8 +8,18 @@ This is the **handoff state** of the AI Reservation SaaS project. New Claude cha
 ## Project state as of handoff
 
 **Phase 0 — COMPLETE.**
-**Phase 1 (all sub-phases 1.1–1.8c) — COMPLETE.** Auth works end-to-end with cookies, 4 integration tests pass.
-**Phase 2 — NEXT** (business admin dashboard shell + core CRUD).
+**Phase 1 (all sub-phases) — COMPLETE.** Auth works end-to-end with cookies.
+**Phase 2 (all sub-phases) — COMPLETE.** Full admin CRUD across services, hours, FAQs, business profile + settings; frontend pages live.
+**Phase 3 (all sub-phases) — COMPLETE.** Local MiniLM embeddings (384-dim), sync on CRUD, backfill done. 51 embeddings in DB (20 service, 31 faq).
+**Phase 4 — IN PROGRESS.**
+- 4.1 Groq LLM integration — DONE
+- 4.2 RAG retrieval helper (pgvector cosine) — DONE
+- 4.3 Minimal 3-node graph (retrieve → answer) — DONE
+- 4.4 Conversation persistence (4-node graph w/ history) — DONE
+- 4.5 Intent classification + conditional branching (question / booking / escalate) — DONE
+- 4.6 Booking flow (15+ nodes) — PENDING (the big one)
+- 4.7 Public chat endpoint + Next.js widget at /chat/[slug] — DONE
+- 4.8 Escalation email via Resend — PENDING
 
 ### Commit history
 
@@ -42,6 +52,23 @@ Phase 1.8 (bootstrap + seed + tests):
 - `5a678b9` — feat(phase-1.8a): super admin bootstrap script
 - (1.8b commit) — feat(phase-1.8b): seed 3 demo businesses with services, hours, and FAQs
 - (1.8c commit) — feat(phase-1.8c): pytest setup and 4 integration tests for auth
+
+Phase 2 (admin CRUD backend + frontend, multiple commits across sub-phases 2.1-2.6).
+Phase 2 outcome: business owner can log in and CRUD services, hours, FAQs, business profile, and settings end-to-end. 14 backend integration tests pass.
+
+Phase 3 (embeddings):
+- `0736dbd` — feat(phase-3.1): sentence-transformers MiniLM embeddings module (384-dim local, lazy-loaded)
+- `fd93ac2` — feat(phase-3.2-3.4): embedding sync service and admin router wiring; embeddings now generated on service/FAQ create/update/delete
+- `936b1d8` — feat(phase-3.5): backfill_embeddings script; Phase 3 complete (51 embeddings in DB)
+
+Phase 4 (chatbot, in progress):
+- `9599e6d` — feat(phase-4.1): Groq LLM integration with chat_completion wrapper and dual-tier model config (FAST = llama-3.1-8b-instant, SMART = llama-3.3-70b-versatile)
+- (4.2 commit) — feat(phase-4.2): RAG retrieval helper with pgvector cosine search; verified against Dhaka Dental
+- `848ec2b` — feat(phase-4.3): minimal LangGraph 3-node chat (retrieve+answer); verified end-to-end against Dhaka Dental
+- `046e230` — feat(phase-4.4): conversation persistence with history; 4-node graph (load_history+retrieve+answer+save_turn); anonymous customer auto-provisioning with synthetic email
+- (4.5 commit) — feat(phase-4.5): intent classification with few-shot prompt + conditional branching to booking/escalate stubs; routing verified on 4-turn dialogue
+- `14b2d92` — feat(phase-4.7a): public POST /api/v1/chat/{slug} endpoint; anonymous, auto-mints customer_id, returns conversation_id + intent
+- `d054360` — feat(phase-4.7b): /chat/[slug] page with ChatWidget client component; localStorage-persisted customer_id; optimistic UI
 
 ---
 
@@ -171,6 +198,18 @@ Phase 1.8 (bootstrap + seed + tests):
 
 17. **Never paste real credentials into chat.** Even local-dev creds. Conversation logs, screenshots, and training pipelines may retain them. Treat the chat like a public forum.
 
+18. **NullPool for SQLAlchemy + Supabase pgbouncer transaction pooler.** Supersedes the `prepared_statement_name_func` lambda in gotcha #11 — that workaround DOES NOT WORK because asyncpg caches the generated name on the connection. Symptom: 500 errors with `asyncpg.exceptions.InvalidSQLStatementNameError: prepared statement "__asyncpg_..." does not exist` after the first ~2 requests succeed. Cause: SQLAlchemy QueuePool reuses asyncpg connections; pgbouncer routes queries to different backend connections that haven't seen the prepared-statement name. **Fix:** `poolclass=NullPool` in `create_async_engine`. Each request opens a fresh asyncpg connection; pgbouncer handles real pooling. Tests passed because pytest uses fresh engines per test (per gotcha #15). Keep `statement_cache_size=0` as belt-and-suspenders. Both flags are set in `app/core/database.py`.
+
+19. **`from __future__ import annotations` + `TYPE_CHECKING` import + dataclass state schema = LangGraph runtime NameError.** LangGraph's `StateGraph(MyState)` constructor calls `get_type_hints(MyState, include_extras=True)` at compile time, forcing evaluation of every annotation. Imports under `if TYPE_CHECKING:` aren't there at runtime → `NameError: name 'AsyncSession' is not defined`. **Fix:** anything annotated on a LangGraph state schema field must be runtime-importable. Move `from sqlalchemy.ext.asyncio import AsyncSession` (and similar) out of `TYPE_CHECKING` for state schema files.
+
+20. **`conversations.session_token` is NOT NULL with no DB default.** Plain `Conversation(business_id=..., customer_id=..., channel=..., status=...)` insert fails with `NotNullViolationError`. The frontend was originally expected to mint and pass the session_token; for server-side chat creation, mint one with `secrets.token_urlsafe(32)` in `get_or_create_conversation`. General lesson: audit NOT NULL columns without server_default before relying on naive ORM inserts. Schema-vs-model gaps surface as runtime IntegrityError.
+
+21. **`customers.ck_customers_email_or_phone` requires email OR phone.** Anonymous chat customers have neither when first contacting the chatbot. **Fix:** synthesize an email `anon-{customer_id}@chat.local` when creating a Customer row from anonymous chat. The `chat.local` domain is non-routable and unambiguously not real; the booking flow can overwrite with the real email later. Also: customers.customer_id is a FK to customers.id, so `get_or_create_conversation` must `_ensure_customer_exists` (create a placeholder Customer row keyed by the customer_id) BEFORE inserting the conversation.
+
+22. **PowerShell expands `[name]` as a character-class wildcard.** `Get-Content src\app\chat\[slug]\page.tsx` silently matches nothing and returns empty (or errors with "Cannot find path"). Affects any Next.js dynamic-route directory. **Fix:** use `-LiteralPath`: `Get-Content -LiteralPath 'src\app\chat\[slug]\page.tsx'`. Or quote the bracketed segment: `'src\app\chat\`[slug`]\page.tsx'`. Or use VSCode/IDE file open. Claude Code's `view` tool handles this transparently.
+
+23. **`str_replace` anchor mismatch fails silently.** If a multi-line `old_str` doesn't exactly match the file content (trailing whitespace, CRLF vs LF, slight indentation drift), Claude Code reports "edit applied" but the file is unchanged. **Mitigation:** verify after every significant edit with `findstr` or `Get-Content` for an unambiguous unique string from the new content. For multi-edit changes to one file, prefer deleting and recreating with `create_file` — single point of failure, easier to debug.
+
 ---
 
 ## Workflow established (keep this going)
@@ -184,42 +223,46 @@ Phase 1.8 (bootstrap + seed + tests):
 
 ---
 
-## What's next — Phase 2
+## What's next — Phase 4.6 (the big one), then 4.8
 
-Per `docs/05-build-phases.md` — 4–5 days.
+### Phase 4.6 — Booking flow (multi-day)
 
-**Goal:** Business admin logs in, sees a dashboard, can CRUD services and hours.
+**Goal:** Customer chats with the AI receptionist, picks a service, picks a date/time, provides contact info, and gets a confirmed booking row in the DB.
 
-**Backend tasks:**
-1. `routers/admin/business.py` — GET/PATCH business, PATCH settings, POST logo upload
-2. `routers/admin/services.py` — full CRUD. Skip embedding sync (stub).
-3. `routers/admin/hours.py` — GET/PUT operating hours, exceptions CRUD
-4. `routers/admin/faqs.py` — CRUD. Skip embedding sync.
-5. `integrations/supabase_storage.py` — image upload helper
-6. Integration tests for services CRUD (create, list, update, delete, scope enforcement)
+The booking node is replacing `booking_stub_node` in `app/services/chat_graph.py`. Per `docs/02-langgraph.md` the booking flow is ~15-18 nodes:
 
-**Frontend tasks:**
-1. `app/(public)/login/page.tsx` + Zustand auth store
-2. `lib/api/client.ts` — fetch wrapper with cookies, error normalization
-3. `components/layout/admin-sidebar.tsx` + admin auth guard layout
-4. `app/admin/page.tsx` — dashboard shell with stat placeholders
-5. `app/admin/services/page.tsx` + `[id]/page.tsx` — services CRUD UI
-6. `app/admin/hours/page.tsx` — 7-day editor
-7. `app/admin/faqs/page.tsx` — FAQ CRUD UI
-8. `app/admin/settings/page.tsx` — business info, logo upload
+1. **service_selection** — extract service name from message or ask. Uses RAG with `source_types=[SERVICE]` filter; if multiple match, ask the customer to pick.
+2. **date_extraction** — parse "Saturday", "tomorrow", "next week", explicit dates. Validate against business `booking_window_days`.
+3. **time_slot_search** — query `operating_hours` + existing `bookings` for the date, return available slots respecting `service.duration_minutes` + `service.buffer_minutes`.
+4. **time_selection** — ask customer to pick from slots (or propose nearest if they asked for a specific time).
+5. **contact_collection** — ask for full_name, email, phone. Validate. Update the placeholder Customer row.
+6. **payment_check** — if `business_settings.require_payment_at_booking`, route to Stripe payment intent creation; else skip.
+7. **confirmation** — create Booking row (status=confirmed or pending_payment), update Conversation.booking_id, send confirmation message.
+8. **escalation_fallback** — if any step fails (no slots, validation, payment fails), route to escalate_stub.
 
-**Done when:**
-- Login as `owner@dhakadental.com` (password `demo1234`) → see sidebar → click Services → see 5 seeded services → edit one → see change persist
-- Edit hours → see change in Supabase
-- Upload logo → see it on dashboard
+Watch for: re-routing on each turn (a customer might bail mid-booking with a question — the intent classifier already handles this).
 
-Phase 2 sub-phase plan (to be confirmed at start):
-- **2.1** — backend admin/business + admin/services CRUD + tests
-- **2.2** — backend admin/hours + admin/faqs CRUD + tests
-- **2.3** — Supabase storage integration for logos
-- **2.4** — frontend auth store + login page + protected layout
-- **2.5** — frontend services + hours + faqs pages
-- **2.6** — frontend settings + dashboard shell
+**Sub-phase plan:**
+- **4.6.1** — service_selection node (RAG-driven, with disambiguation)
+- **4.6.2** — date + time slot logic (no LLM; deterministic date parsing + DB query)
+- **4.6.3** — contact_collection node (updates placeholder Customer)
+- **4.6.4** — Booking row creation + Conversation update; skip Stripe (deferred to Phase 5)
+- **4.6.5** — End-to-end verification: chat → "I want to book a cleaning Saturday" → walks through full flow → booking row in DB
+
+### Phase 4.8 — Escalation email via Resend
+
+**Goal:** When `escalate_stub_node` fires, send an email to the business's `business_settings.escalation_email` so a human knows to follow up.
+
+Small, contained: ~1-2 hours.
+
+Files: `app/integrations/resend.py` (thin wrapper), update `escalate_stub_node` to call it best-effort.
+
+Resend free tier: 3000 emails/month. Use `noreply@yourdomain` as From. Test mode initially.
+
+### Tech debt to address before going to production
+- 49 anonymous test businesses accumulated in Supabase from cumulative pytest runs. Tests should be torn down or use a dedicated schema. Phase 11 polish.
+- Logo upload (Phase 2.3) was deferred. Needs Supabase Storage bucket + service-role key.
+- Streaming chat responses (currently single fetch per turn). Polish for Phase 11.
 
 ---
 
@@ -228,7 +271,13 @@ Phase 2 sub-phase plan (to be confirmed at start):
 1. Read `CLAUDE.md` at project root
 2. Read all 9 files in `docs/`, especially this one
 3. Confirm understanding by summarizing:
-   - Current state: Phase 1 complete; auth tested end-to-end; 1 super admin + 4 businesses + demo data in Supabase. Phase 2 next.
-   - Supabase URL pattern: pooler at `aws-1-ap-southeast-2`, async port 6543, `statement_cache_size=0`.
-   - The 17 gotchas — especially: `postgresql.ENUM` (not `sa.Enum`); bcrypt direct (not passlib); fresh engine per test; never paste creds.
-4. Wait for the user to say "start Phase 2.1" before producing prompts.
+   - Current state: Phases 0-3 complete; Phase 4 partially complete (4.1-4.5 + 4.7 done; 4.6 + 4.8 pending). Chatbot works end-to-end via `/chat/[slug]`; intent routing correct; conversation persistence working; booking is currently a stub.
+   - Supabase URL pattern: pooler at `aws-1-ap-southeast-2`, async port 6543, **NullPool** (per gotcha #18).
+   - The 23 gotchas — especially:
+     - #18 (NullPool, supersedes #11's lambda)
+     - #19 (LangGraph + TYPE_CHECKING incompatibility)
+     - #20 + #21 (Customer + Conversation insert chain for anonymous chatbot customers)
+     - #22 (PowerShell `[slug]` wildcard)
+     - #23 (str_replace silent failure — always verify with findstr after edits)
+   - Strict workflow: web-chat Claude writes file-edit prompts; user runs ALL shell commands; never ask Claude Code for shell commands or to print secrets.
+4. Wait for the user to say what to start before producing prompts. Likely "start Phase 4.6.1" or "start Phase 4.8".
