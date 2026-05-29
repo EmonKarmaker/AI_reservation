@@ -30,6 +30,13 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.llm import chat_completion
+from app.models.enums import MessageRole
+from app.models.message import Message
+from app.services.conversation_store import (
+    append_message,
+    get_or_create_conversation,
+    list_recent_messages,
+)
 from app.services.rag import RetrievedChunk, retrieve_relevant
 
 
@@ -44,23 +51,30 @@ logger = logging.getLogger(__name__)
 class ChatState:
     """State carried across all graph nodes.
 
-    Inputs (set by the caller before invoke):
-    - ``db``           : Active async session (the graph needs DB access for RAG).
+    Required inputs:
+    - ``db``           : Active async session.
     - ``business_id``  : Tenant whose embeddings to search.
-    - ``business_name``: Used in the system prompt so the AI knows who it represents.
-    - ``business_greeting`` : Optional. The business's configured AI greeting.
-    - ``business_personality`` : Optional. The business's configured AI personality.
+    - ``business_name``: Used in the system prompt.
+    - ``customer_id``  : Identifies the chat session. The frontend generates
+                         this per-browser; for now any stable UUID works.
     - ``user_message`` : The customer's latest message.
 
+    Optional inputs:
+    - ``business_greeting``    : The business's configured AI greeting.
+    - ``business_personality`` : The business's configured AI personality.
+
     Populated by graph execution:
-    - ``retrieved_chunks`` : RAG results (populated by 'retrieve' node).
-    - ``assistant_message``: Final LLM reply (populated by 'answer' node).
+    - ``conversation_id``  : The conversation row id (loaded by 'load_history').
+    - ``history``          : Prior messages, oldest first (loaded by 'load_history').
+    - ``retrieved_chunks`` : RAG results (loaded by 'retrieve').
+    - ``assistant_message``: Final LLM reply (loaded by 'answer').
     """
 
     # Required inputs
     db: AsyncSession
     business_id: UUID
     business_name: str
+    customer_id: UUID
     user_message: str
 
     # Optional inputs
@@ -68,6 +82,8 @@ class ChatState:
     business_personality: str | None = None
 
     # Filled by nodes
+    conversation_id: UUID | None = None
+    history: list[Message] = field(default_factory=list)
     retrieved_chunks: list[RetrievedChunk] = field(default_factory=list)
     assistant_message: str = ""
 
@@ -76,11 +92,27 @@ class ChatState:
 # Nodes
 # ---------------------------------------------------------------------------
 
-async def retrieve_node(state: ChatState) -> dict:
-    """Retrieve top-k relevant embeddings for the user's message.
+async def load_history_node(state: ChatState) -> dict:
+    """Resolve the conversation and load the last N messages."""
+    conversation = await get_or_create_conversation(
+        state.db,
+        business_id=state.business_id,
+        customer_id=state.customer_id,
+    )
+    history = await list_recent_messages(
+        state.db,
+        conversation_id=conversation.id,
+    )
+    logger.info(
+        "Loaded conversation=%s with %d prior messages",
+        conversation.id,
+        len(history),
+    )
+    return {"conversation_id": conversation.id, "history": history}
 
-    Pure RAG step — no LLM call here. Wraps retrieve_relevant from Phase 4.2.
-    """
+
+async def retrieve_node(state: ChatState) -> dict:
+    """Retrieve top-k relevant embeddings for the user's message."""
     chunks = await retrieve_relevant(
         state.db,
         business_id=state.business_id,
@@ -141,18 +173,24 @@ def _build_system_prompt(state: ChatState) -> str:
 
 
 async def answer_node(state: ChatState) -> dict:
-    """Call the LLM with the user message + system prompt and return the reply."""
+    """Call the LLM with system prompt + history + new user message."""
     system_prompt = _build_system_prompt(state)
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": state.user_message},
-    ]
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+
+    # Replay prior turns. Filter out anything that isn't user/assistant — the
+    # OpenAI-style schema rejects unknown roles, and there's no point
+    # forwarding tool/system messages from earlier turns to a fresh prompt.
+    for m in state.history:
+        if m.role in (MessageRole.USER, MessageRole.ASSISTANT):
+            messages.append({"role": m.role.value, "content": m.content})
+
+    # The new user message comes last so the model knows what to respond to.
+    messages.append({"role": "user", "content": state.user_message})
 
     try:
         reply = await chat_completion(messages, temperature=0.3)
     except Exception as exc:  # noqa: BLE001
-        # Best-effort fallback. We never want a chatbot to 500.
         logger.warning("LLM call failed in answer_node: %s", exc)
         reply = (
             "I'm having trouble answering that right now. Could you try again "
@@ -162,29 +200,60 @@ async def answer_node(state: ChatState) -> dict:
     return {"assistant_message": reply}
 
 
+async def save_turn_node(state: ChatState) -> dict:
+    """Persist the user message and the AI reply.
+
+    Runs LAST so a failure here doesn't poison the in-memory state. If
+    persistence fails we still return a usable assistant_message to the
+    caller; the conversation just won't be re-readable later.
+    """
+    if state.conversation_id is None:
+        logger.warning("save_turn_node: no conversation_id; skipping persistence")
+        return {}
+
+    try:
+        await append_message(
+            state.db,
+            conversation_id=state.conversation_id,
+            role=MessageRole.USER,
+            content=state.user_message,
+        )
+        await append_message(
+            state.db,
+            conversation_id=state.conversation_id,
+            role=MessageRole.ASSISTANT,
+            content=state.assistant_message,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to persist chat turn: %s", exc)
+
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Graph construction
 # ---------------------------------------------------------------------------
 
 def build_chat_graph():
-    """Construct the 3-node graph: retrieve → answer → END.
+    """Construct the 4-node graph:
+        load_history → retrieve → answer → save_turn → END.
 
-    Compiled at module import time (cached). Each request reuses the compiled
-    graph; only the per-request state is fresh.
-
-    Returns a compiled LangGraph runnable. The caller invokes via
-    ``await graph.ainvoke(initial_state)``.
+    Compiled once, reused for every request.
     """
     from langgraph.graph import END, START, StateGraph
 
     graph = StateGraph(ChatState)
 
+    graph.add_node("load_history", load_history_node)
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("answer", answer_node)
+    graph.add_node("save_turn", save_turn_node)
 
-    graph.add_edge(START, "retrieve")
+    graph.add_edge(START, "load_history")
+    graph.add_edge("load_history", "retrieve")
     graph.add_edge("retrieve", "answer")
-    graph.add_edge("answer", END)
+    graph.add_edge("answer", "save_turn")
+    graph.add_edge("save_turn", END)
 
     return graph.compile()
 
@@ -215,17 +284,15 @@ async def run_chat_turn(
     db: AsyncSession,
     business_id: UUID,
     business_name: str,
+    customer_id: UUID,
     user_message: str,
     business_greeting: str | None = None,
     business_personality: str | None = None,
 ) -> ChatState:
     """Run one user message through the graph and return the final state.
 
-    Convenience wrapper for callers (verification scripts, the future
-    /chat endpoint) so they don't have to assemble ChatState themselves.
-
-    Returns the FINAL state, from which the caller reads
-    ``state.assistant_message`` to send back to the user.
+    Returns the FINAL state. Callers read ``state.assistant_message`` for the
+    reply and ``state.conversation_id`` if they need to reference the row.
     """
     graph = get_chat_graph()
 
@@ -233,25 +300,26 @@ async def run_chat_turn(
         db=db,
         business_id=business_id,
         business_name=business_name,
+        customer_id=customer_id,
         user_message=user_message,
         business_greeting=business_greeting,
         business_personality=business_personality,
     )
 
-    # LangGraph's ainvoke can return either a dict or the state class
-    # depending on version; normalise to ChatState by re-hydrating.
     result = await graph.ainvoke(initial_state)
     if isinstance(result, ChatState):
         return result
 
-    # Result is dict-like. Build a fresh ChatState carrying the final values.
     return ChatState(
         db=db,
         business_id=business_id,
         business_name=business_name,
+        customer_id=customer_id,
         user_message=user_message,
         business_greeting=business_greeting,
         business_personality=business_personality,
+        conversation_id=result.get("conversation_id"),
+        history=result.get("history", []),
         retrieved_chunks=result.get("retrieved_chunks", []),
         assistant_message=result.get("assistant_message", ""),
     )

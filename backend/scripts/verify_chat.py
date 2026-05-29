@@ -1,8 +1,10 @@
-"""One-off: drive a few real chat turns through the Phase 4.3 graph.
+"""One-off: drive a multi-turn conversation through the chat graph.
 
-Hits Dhaka Dental with several realistic customer questions and prints both
-the retrieved chunks (so we can see RAG is working) and the LLM answer (so
-we can see grounding is working).
+Two-turn dialogue verifies that:
+1. The 4-node graph (load_history → retrieve → answer → save_turn) runs.
+2. Messages are persisted (count goes from 0 → 2 → 4).
+3. The second turn HAS access to history (we ask a follow-up that depends
+   on the prior assistant message).
 
 Run from backend/ with:
     .venv\\Scripts\\python scripts\\verify_chat.py
@@ -11,7 +13,7 @@ Run from backend/ with:
 from __future__ import annotations
 
 import asyncio
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 
@@ -21,12 +23,12 @@ from app.services.chat_graph import run_chat_turn
 
 
 DHAKA_DENTAL_ID = UUID("dc37dd35-bc92-4e6e-bce1-596b01a17a42")
+# Fresh customer id per script run so we always start a clean conversation.
+CUSTOMER_ID = uuid4()
 
-QUESTIONS = [
-    "Hi! Do you do root canals?",
+TURNS = [
     "How much does a routine cleaning cost?",
-    "What are your hours on Saturday?",
-    "Can you do open-heart surgery?",  # out-of-scope; should refuse gracefully
+    "Great, can I book one for Saturday morning?",  # depends on history
 ]
 
 
@@ -36,22 +38,23 @@ async def main() -> None:
             await db.execute(select(Business).where(Business.id == DHAKA_DENTAL_ID))
         ).scalar_one()
         print(f"Business: {business.name} ({business.slug})")
-        print(f"Personality: {business.ai_personality or '(none set)'}\n")
+        print(f"Customer:  {CUSTOMER_ID}\n")
 
-        for q in QUESTIONS:
-            print(f"USER: {q}")
+        for i, msg in enumerate(TURNS, start=1):
+            print(f"--- TURN {i} ---")
+            print(f"USER: {msg}")
             state = await run_chat_turn(
                 db=db,
                 business_id=DHAKA_DENTAL_ID,
                 business_name=business.name,
-                user_message=q,
+                customer_id=CUSTOMER_ID,
+                user_message=msg,
                 business_greeting=business.ai_greeting,
                 business_personality=business.ai_personality,
             )
+            print(f"  conversation_id: {state.conversation_id}")
+            print(f"  history loaded: {len(state.history)} prior messages")
             print(f"  retrieved: {len(state.retrieved_chunks)} chunks")
-            for i, c in enumerate(state.retrieved_chunks[:2], start=1):
-                snippet = c.content[:70].replace("\n", " ")
-                print(f"    {i}. [{c.source_type.value}] d={c.distance:.3f}  {snippet!r}")
             print(f"AI: {state.assistant_message}\n")
 
 
