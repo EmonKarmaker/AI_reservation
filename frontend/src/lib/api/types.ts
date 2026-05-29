@@ -96,3 +96,21 @@ export class ApiError extends Error {
     this.detail = detail;
   }
 }
+
+// Public chat endpoint (POST /chat/{business_slug}).
+
+export type ChatIntent = "question" | "booking" | "escalate";
+
+export interface ChatRequest {
+  // Omit on the very first request from this browser; server mints one
+  // and the client persists it in localStorage.
+  customer_id?: string;
+  message: string;
+}
+
+export interface ChatResponse {
+  conversation_id: string;
+  customer_id: string;
+  message: string;
+  intent: ChatIntent;
+}
