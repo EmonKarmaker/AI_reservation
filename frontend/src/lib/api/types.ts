@@ -38,6 +38,17 @@ export interface BusinessOut {
   cancellation_hours: number;
 }
 
+export interface BusinessSettingsOut {
+  id: string;
+  business_id: string;
+  require_payment_at_booking: boolean;
+  deposit_percentage: number;
+  auto_confirm_bookings: boolean;
+  send_reminder_hours_before: number;
+  escalation_email: string | null;
+  max_daily_bookings: number | null;
+}
+
 export interface ServiceOut {
   id: string;
   business_id: string;
