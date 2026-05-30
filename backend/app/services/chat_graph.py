@@ -32,6 +32,7 @@ from app.integrations.resend_email import EmailError, send_email
 from app.models.business_setting import BusinessSetting
 from app.models.enums import MessageRole
 from app.models.message import Message
+from app.services.booking_flow import booking_node
 from app.services.conversation_store import (
     append_message,
     get_or_create_conversation,
@@ -289,17 +290,7 @@ async def answer_node(state: ChatState) -> dict:
     return {"assistant_message": reply}
 
 
-# --- Booking + escalate stubs (replaced in Phase 4.6/4.8) -----------------
-
-async def booking_stub_node(state: ChatState) -> dict:
-    """Polite deferral for booking requests. Phase 4.6 replaces this."""
-    reply = (
-        f"I'd love to help you book that. Let me hand you to the {state.business_name} "
-        "team — they'll reach out to confirm the details. In the meantime, can I "
-        "answer any other questions?"
-    )
-    return {"assistant_message": reply}
-
+# --- Escalate stub (replaced in Phase 4.8) ---------------------------------
 
 def _format_escalation_email(state: ChatState) -> tuple[str, str]:
     """Compose (subject, html) for the escalation email.
@@ -465,7 +456,7 @@ async def save_turn_node(state: ChatState) -> dict:
 def _route_by_intent(state: ChatState) -> str:
     """Map intent → next node name for the conditional edge."""
     if state.intent == "booking":
-        return "booking_stub"
+        return "booking"
     if state.intent == "escalate":
         return "escalate_stub"
     return "retrieve"
@@ -481,7 +472,7 @@ def build_chat_graph():
     graph.add_node("classify_intent", classify_intent_node)
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("answer", answer_node)
-    graph.add_node("booking_stub", booking_stub_node)
+    graph.add_node("booking", booking_node)
     graph.add_node("escalate_stub", escalate_stub_node)
     graph.add_node("save_turn", save_turn_node)
 
@@ -493,14 +484,14 @@ def build_chat_graph():
         _route_by_intent,
         {
             "retrieve": "retrieve",
-            "booking_stub": "booking_stub",
+            "booking": "booking",
             "escalate_stub": "escalate_stub",
         },
     )
 
     graph.add_edge("retrieve", "answer")
     graph.add_edge("answer", "save_turn")
-    graph.add_edge("booking_stub", "save_turn")
+    graph.add_edge("booking", "save_turn")
     graph.add_edge("escalate_stub", "save_turn")
     graph.add_edge("save_turn", END)
 
