@@ -31,12 +31,16 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.business import Business
 from app.models.conversation import Conversation
 from app.models.enums import EmbeddingSourceType
 from app.models.service import Service
+from app.services.date_parser import parse_booking_date, today_in_business_tz
 from app.services.rag import retrieve_relevant
+from app.services.slot_finder import Slot, extract_time_window, find_available_slots
 
 if TYPE_CHECKING:
+    from datetime import date as date_type
     from app.services.chat_graph import ChatState
 
 
@@ -95,6 +99,22 @@ def _get_booking_draft(conversation: Conversation) -> dict:
     return draft
 
 
+def get_active_booking_stage(conversation: Conversation) -> str | None:
+    """Return the current booking stage, or None if no booking is in progress.
+
+    Used by chat_graph to decide whether to make the booking flow "sticky" —
+    when a booking is in progress, ambiguous user messages should keep
+    routing to the booking flow instead of being treated as new questions.
+
+    Returns None if no draft, or if the draft is at the COMPLETE stage.
+    """
+    draft = _get_booking_draft(conversation)
+    stage = draft.get("stage")
+    if not stage or stage == STAGE_COMPLETE:
+        return None
+    return stage
+
+
 async def _save_booking_draft(
     db: AsyncSession,
     conversation: Conversation,
@@ -106,11 +126,17 @@ async def _save_booking_draft(
     SQLAlchemy's change-detection sees the update. In-place mutation of
     JSONB columns is famously not detected without sqlalchemy.ext.mutable.
 
-    Only the booking_draft sub-key is touched; other state keys are
-    preserved.
+    CRITICAL: we COPY `draft` (dict(draft)) rather than store a reference,
+    so SQLAlchemy's committed_state holds an isolated snapshot. Without the
+    copy, subsequent in-place mutations of the caller's `draft` variable
+    also silently mutate committed_state. The next flush then compares
+    "current == committed" as True (same contents) and SKIPS the write —
+    so all writes after the first per-turn save are silently lost.
+
+    Only the booking_draft sub-key is touched; other state keys are preserved.
     """
     state = dict(conversation.langgraph_state or {})
-    state["booking_draft"] = draft
+    state["booking_draft"] = dict(draft)  # snapshot copy — see CRITICAL comment
     conversation.langgraph_state = state
     # Flush so the change is in the transaction; save_turn_node will commit
     # it alongside the message inserts at end of turn.
@@ -194,6 +220,13 @@ async def _identify_service(
         if not candidate_ids:
             return None, []
         alts = await _load_services_by_ids(db, business_id, candidate_ids)
+        # If only one service survives the cutoff + active filter, treat it
+        # as the answer rather than a one-item disambiguation. Common case:
+        # the customer's phrasing ("I want to book a X") puts MiniLM's
+        # distance to the service ~0.4-0.5 because of the extra framing
+        # words, but no other service is even remotely relevant.
+        if len(alts) == 1:
+            return alts[0], []
         return None, alts
 
     # --- Case 2: top match is strong, but runner-up is close --------------
@@ -311,14 +344,16 @@ async def booking_node(state: "ChatState") -> dict:
 
     if stage == STAGE_AWAITING_SERVICE:
         return await _handle_awaiting_service(state, conversation, draft)
+    if stage == STAGE_AWAITING_DATE:
+        return await _handle_awaiting_date(state, conversation, draft)
 
-    # Phases 4.6.2+ will fill these in. For now, polite placeholder that
-    # acknowledges progress without pretending to handle the step.
+    # STAGE_AWAITING_SLOT, _CONTACT, and _COMPLETE will be implemented in
+    # later sub-phases (4.6.2b through 4.6.4). Polite acknowledgment for now.
     return {
         "assistant_message": (
-            f"Got it — I've noted that. The full booking flow is still being "
-            f"set up, so a team member from {state.business_name} will follow "
-            "up shortly to confirm the date and time. Anything else I can help with?"
+            f"Got it — I've noted that. The next part of the booking flow is "
+            f"still being set up, so a team member from {state.business_name} "
+            "will follow up shortly to confirm. Anything else I can help with?"
         )
     }
 
@@ -329,6 +364,15 @@ async def _handle_awaiting_service(
     draft: dict,
 ) -> dict:
     """Identify the requested service or ask the customer to pick one."""
+    # Persist the stage marker BEFORE we know this turn's outcome, so that
+    # sticky routing in chat_graph fires on the NEXT turn even when this
+    # turn ends in disambiguation (no service picked yet, no other state to
+    # persist). Without this, the draft stays {} and follow-up messages
+    # like "Routine Cleaning" or "Monday" get re-classified as questions.
+    if draft.get("stage") != STAGE_AWAITING_SERVICE:
+        draft["stage"] = STAGE_AWAITING_SERVICE
+        await _save_booking_draft(state.db, conversation, draft)
+
     matched, alternatives = await _identify_service(
         state.db, state.business_id, state.user_message
     )
@@ -386,5 +430,171 @@ async def _handle_awaiting_service(
         "assistant_message": (
             "Happy to help you book! Which service would you like?\n\n"
             f"{menu}"
+        )
+    }
+
+
+# ---------------------------------------------------------------------------
+# Date stage
+# ---------------------------------------------------------------------------
+
+async def _load_business(db: AsyncSession, business_id) -> Business | None:
+    result = await db.execute(select(Business).where(Business.id == business_id))
+    return result.scalar_one_or_none()
+
+
+async def _load_service(
+    db: AsyncSession, business_id, service_id_str: str
+) -> Service | None:
+    """Re-load the service stored in the draft, scoped by tenant + active."""
+    from uuid import UUID as _UUID  # local import to avoid top-level noise
+
+    try:
+        sid = _UUID(service_id_str)
+    except (TypeError, ValueError):
+        return None
+    return await _load_service_by_id(db, business_id, sid)
+
+
+def _format_slot_menu(slots: list[Slot]) -> str:
+    return "\n".join(f"- {s.display}" for s in slots)
+
+
+async def _handle_awaiting_date(
+    state: "ChatState",
+    conversation: Conversation,
+    draft: dict,
+) -> dict:
+    """Parse the customer's date, validate, find slots, advance to awaiting_slot.
+
+    Failure modes (each results in an explanatory reply, draft stays at
+    awaiting_date so customer can retry):
+    - No date detectable in the message
+    - Date in the past
+    - Date beyond business.booking_window_days
+    - Business closed that day
+    - No available slots after conflicts/filters
+
+    On success: draft.requested_date / time_window / offered_slots are saved,
+    stage advances to awaiting_slot, and the slots are presented.
+    """
+    business = await _load_business(state.db, state.business_id)
+    if business is None:
+        logger.warning("_handle_awaiting_date: business %s not found", state.business_id)
+        return {
+            "assistant_message": (
+                "I'm having trouble accessing the booking system. "
+                "Please try again in a moment."
+            )
+        }
+
+    service = await _load_service(state.db, state.business_id, draft.get("service_id", ""))
+    if service is None:
+        # Service was deleted/deactivated since draft started — reset.
+        draft.clear()
+        await _save_booking_draft(state.db, conversation, draft)
+        return {
+            "assistant_message": (
+                "The service you picked is no longer available. "
+                "Could you let me know what you'd like to book instead?"
+            )
+        }
+
+    parsed_date = await parse_booking_date(
+        state.user_message,
+        business_timezone=business.timezone,
+    )
+
+    if parsed_date is None:
+        return {
+            "assistant_message": (
+                "I didn't catch a date there. Could you tell me a day that "
+                "works for you? For example: 'next Saturday' or 'June 7'."
+            )
+        }
+
+    today = today_in_business_tz(business.timezone)
+
+    if parsed_date < today:
+        return {
+            "assistant_message": (
+                f"That date ({parsed_date.strftime('%A, %B %d')}) is already in "
+                "the past. What upcoming date works?"
+            )
+        }
+
+    from datetime import timedelta as _td  # local; avoids top-level clutter
+
+    max_date = today + _td(days=business.booking_window_days)
+    if parsed_date > max_date:
+        return {
+            "assistant_message": (
+                f"We can only book up to {business.booking_window_days} days "
+                f"ahead — so the latest is {max_date.strftime('%A, %B %d')}. "
+                "Could you choose a closer date?"
+            )
+        }
+
+    time_window = extract_time_window(state.user_message)
+
+    slots = await find_available_slots(
+        state.db,
+        business=business,
+        service=service,
+        target_date=parsed_date,
+        time_window=time_window,
+        limit=3,
+    )
+
+    if not slots:
+        # Could be: closed that day, fully booked, or window has no openings.
+        # Distinguish closed-day case for a more helpful message.
+        from app.services.slot_finder import _get_operating_hours, weekday_string
+
+        hours = await _get_operating_hours(
+            state.db, business.id, weekday_string(parsed_date)
+        )
+        if hours is None or hours.is_closed:
+            return {
+                "assistant_message": (
+                    f"We're closed on {parsed_date.strftime('%A')}. "
+                    "What other date works for you?"
+                )
+            }
+        if time_window:
+            return {
+                "assistant_message": (
+                    f"I don't see {time_window} openings on "
+                    f"{parsed_date.strftime('%A, %B %d')}. Would another day "
+                    "or a different time of day work?"
+                )
+            }
+        return {
+            "assistant_message": (
+                f"Unfortunately {parsed_date.strftime('%A, %B %d')} is fully "
+                "booked. Could you try another date?"
+            )
+        }
+
+    # Persist
+    draft["requested_date"] = parsed_date.isoformat()
+    draft["time_window"] = time_window
+    draft["offered_slots"] = [s.iso for s in slots]
+    draft["stage"] = STAGE_AWAITING_SLOT
+    await _save_booking_draft(state.db, conversation, draft)
+
+    logger.info(
+        "booking_node: advanced to awaiting_slot — date=%s window=%r slots=%d",
+        parsed_date,
+        time_window,
+        len(slots),
+    )
+
+    menu = _format_slot_menu(slots)
+    return {
+        "assistant_message": (
+            f"Great — here's what's available on "
+            f"{parsed_date.strftime('%A, %B %d')}:\n\n{menu}\n\n"
+            "Which time works for you?"
         )
     }

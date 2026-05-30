@@ -90,6 +90,9 @@ class ChatState:
     intent: Intent = DEFAULT_INTENT
     retrieved_chunks: list[RetrievedChunk] = field(default_factory=list)
     assistant_message: str = ""
+    # Populated by load_history_node when a booking is mid-flow. None means
+    # no active draft. Used by classify_intent_node for sticky routing.
+    booking_stage: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +100,14 @@ class ChatState:
 # ---------------------------------------------------------------------------
 
 async def load_history_node(state: ChatState) -> dict:
-    """Resolve the conversation and load the last N messages."""
+    """Resolve the conversation and load the last N messages.
+
+    Also extracts the current booking stage from the conversation's
+    langgraph_state so downstream nodes (classify_intent) can decide whether
+    to apply sticky routing.
+    """
+    from app.services.booking_flow import get_active_booking_stage
+
     conversation = await get_or_create_conversation(
         state.db,
         business_id=state.business_id,
@@ -107,12 +117,18 @@ async def load_history_node(state: ChatState) -> dict:
         state.db,
         conversation_id=conversation.id,
     )
+    booking_stage = get_active_booking_stage(conversation)
     logger.info(
-        "Loaded conversation=%s with %d prior messages",
+        "Loaded conversation=%s with %d prior messages (booking_stage=%r)",
         conversation.id,
         len(history),
+        booking_stage,
     )
-    return {"conversation_id": conversation.id, "history": history}
+    return {
+        "conversation_id": conversation.id,
+        "history": history,
+        "booking_stage": booking_stage,
+    }
 
 
 # --- Intent classification -------------------------------------------------
@@ -204,7 +220,21 @@ async def classify_intent_node(state: ChatState) -> dict:
         return {"intent": DEFAULT_INTENT}
 
     intent = _parse_intent(raw)
-    logger.info("Classified intent: %s (raw=%r)", intent, raw[:30])
+
+    # Sticky booking flow: if the customer is mid-booking and the classifier
+    # returned "question", treat it as a continuation of the booking. Short
+    # answers like "Saturday" or "10:30 AM" can otherwise look like questions
+    # to the classifier. We deliberately do NOT override "escalate" — an
+    # angry customer must always be able to break out of a booking.
+    if intent == "question" and state.booking_stage:
+        logger.info(
+            "Sticky booking: overriding question → booking (stage=%s)",
+            state.booking_stage,
+        )
+        intent = "booking"
+    else:
+        logger.info("Classified intent: %s (raw=%r)", intent, raw[:30])
+
     return {"intent": intent}
 
 
