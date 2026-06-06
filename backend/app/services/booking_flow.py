@@ -817,19 +817,77 @@ _PHONE_MIN_DIGITS = 7
 _PHONE_MAX_DIGITS = 15
 
 
+# Common preambles to strip from the start of a message before treating
+# the rest as the customer's name. Greedy: longer phrases first so that
+# "hi i'm John" strips both "hi" and "i'm" rather than just "hi".
+_NAME_PREAMBLE_RE = re.compile(
+    r"^("
+    r"(?:hi|hello|hey),?\s+(?:i'?m|i\s+am|this\s+is)\s+|"
+    r"my\s+name\s+is\s+|"
+    r"this\s+is\s+|"
+    r"call\s+me\s+|"
+    r"i\s+am\s+|"
+    r"i'?m\s+|"
+    r"it'?s\s+|"
+    r"name'?s\s+"
+    r")",
+    re.IGNORECASE,
+)
+
+# Words that strongly suggest the message is a booking-related sentence
+# rather than a name. Checked as whole words (\b) so we don't false-reject
+# real names that happen to contain these substrings (e.g. "Booker" in a
+# surname). Greetings included so "hi there John" doesn't sneak past the
+# preamble strip and get captured wholesale.
+_NAME_REJECT_WORD_RE = re.compile(
+    r"\b(?:book|booking|schedule|scheduling|appointment|appointments|"
+    r"want|wants|wanted|need|needs|needed|would|could|should|"
+    r"cancel|cancels|cancelled|reschedule|rescheduling|"
+    r"reserve|reserves|reserved|"
+    r"hi|hello|hey|thanks|thank)\b",
+    re.IGNORECASE,
+)
+
+
 def _extract_name(message: str) -> str | None:
     """Pull a plausible full name out of the customer's message.
 
-    Lenient by design: accept anything 2-100 chars with at least one letter.
-    We don't try to enforce "two words" or capitalization — names vary too
-    much across cultures, and rejecting a legitimate single-word name (Madonna,
-    Cher) annoys customers more than accepting "Bob" annoys the business.
+    Strips a leading preamble ("my name is X", "I'm X", "Hi, I'm X") so
+    the bot doesn't capture those framing words as part of the name.
+
+    Then validates: 2-100 chars, at least one letter, at most 6 words,
+    no booking-request verbs. The word-count + verb checks catch the
+    common failure mode where a customer starts over mid-flow ("I want
+    to book a routine cleaning") at the awaiting_contact stage and the
+    handler would otherwise treat that sentence as their name.
+
+    Lenient on cultural variation: single-word names (Madonna, Cher) are
+    valid, and 6 words covers long honorifics like "Sheikh Mohammed bin
+    Rashid Al Maktoum" without being so loose that "I want to book a
+    routine cleaning" gets through.
+
+    Returns the cleaned name, or None if the message doesn't look like a
+    name. In the None case the caller re-asks the same field.
     """
-    name = message.strip()
+    raw = message.strip()
+    if not raw:
+        return None
+
+    # Strip a leading preamble like "my name is", "I'm", "hi I am", etc.
+    name = _NAME_PREAMBLE_RE.sub("", raw, count=1).strip()
+    name = name.rstrip(".!,;:")  # drop trailing punctuation
+
     if len(name) < 2 or len(name) > 100:
         return None
     if not any(c.isalpha() for c in name):
         return None
+
+    # Reject obvious non-names.
+    if len(name.split()) > 6:
+        return None
+    if _NAME_REJECT_WORD_RE.search(name):
+        return None
+
     return name
 
 
