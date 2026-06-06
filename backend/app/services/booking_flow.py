@@ -370,14 +370,15 @@ async def booking_node(state: "ChatState") -> dict:
         return await _handle_awaiting_date(state, conversation, draft)
     if stage == STAGE_AWAITING_SLOT:
         return await _handle_awaiting_slot(state, conversation, draft)
+    if stage == STAGE_AWAITING_CONTACT:
+        return await _handle_awaiting_contact(state, conversation, draft)
 
-    # STAGE_AWAITING_CONTACT and _COMPLETE will be implemented in later
-    # sub-phases (4.6.3 and 4.6.4). Polite acknowledgment for now.
+    # STAGE_COMPLETE — actual Booking row creation lands in 4.6.4. For now,
+    # if we somehow reach this stage, give a polite acknowledgement.
     return {
         "assistant_message": (
-            f"Got it — I've noted that. The next part of the booking flow is "
-            f"still being set up, so a team member from {state.business_name} "
-            "will follow up shortly to confirm. Anything else I can help with?"
+            f"Thanks! The {state.business_name} team will reach out shortly "
+            "to confirm your booking. Anything else I can help with?"
         )
     }
 
@@ -793,5 +794,176 @@ async def _handle_awaiting_slot(
         "assistant_message": (
             f"Got it — {date_str} at {time_str}. To confirm the booking I "
             "just need a few details. What's your full name?"
+        )
+    }
+
+
+# ---------------------------------------------------------------------------
+# Contact stage
+# ---------------------------------------------------------------------------
+
+# Email regex: pragmatic, not RFC-perfect. We just want to know whether the
+# message contains something email-shaped. We do not validate the domain.
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
+# Minimum number of digits a "phone number" must contain. Bangladesh local
+# numbers are 11 digits; international format is up to 15. Allow as low as 7
+# for international short codes / partial numbers (we'll still capture them
+# without rejecting an otherwise valid customer entry).
+_PHONE_MIN_DIGITS = 7
+_PHONE_MAX_DIGITS = 15
+
+
+def _extract_name(message: str) -> str | None:
+    """Pull a plausible full name out of the customer's message.
+
+    Lenient by design: accept anything 2-100 chars with at least one letter.
+    We don't try to enforce "two words" or capitalization — names vary too
+    much across cultures, and rejecting a legitimate single-word name (Madonna,
+    Cher) annoys customers more than accepting "Bob" annoys the business.
+    """
+    name = message.strip()
+    if len(name) < 2 or len(name) > 100:
+        return None
+    if not any(c.isalpha() for c in name):
+        return None
+    return name
+
+
+def _extract_email(message: str) -> str | None:
+    """Find the first email-shaped substring in the message, lowercased."""
+    match = _EMAIL_RE.search(message)
+    if not match:
+        return None
+    return match.group(0).lower()
+
+
+def _extract_phone(message: str) -> str | None:
+    """Return a normalized phone string if the message contains enough digits.
+
+    Strips everything except digits and a leading '+'. Counts digits; if the
+    count is in the plausible range, returns the cleaned form. Otherwise None.
+    """
+    # Keep digits and + only
+    cleaned = re.sub(r"[^\d+]", "", message)
+    # The '+' is only valid as the first char
+    if cleaned.startswith("+"):
+        digits = cleaned[1:]
+    else:
+        digits = cleaned
+    if not digits.isdigit():
+        return None
+    if not (_PHONE_MIN_DIGITS <= len(digits) <= _PHONE_MAX_DIGITS):
+        return None
+    return cleaned
+
+
+async def _handle_awaiting_contact(
+    state: "ChatState",
+    conversation: Conversation,
+    draft: dict,
+) -> dict:
+    """Walk the customer through name → email → phone collection.
+
+    Routes by inspecting which fields are already in the draft:
+    - customer_name missing → this turn IS the name. Save, ask for email.
+    - customer_email missing → this turn IS the email. Save, ask for phone.
+    - customer_phone missing → this turn IS the phone. Save, advance to
+      STAGE_COMPLETE.
+
+    On unparseable input, re-asks for the same field without advancing.
+
+    (Booking row creation happens in 4.6.4 — for now we just persist the
+    contact fields in the draft and stop with an acknowledgement.)
+    """
+    # --- Collecting the name --------------------------------------------------
+    if draft.get("customer_name") is None:
+        name = _extract_name(state.user_message)
+        if name is None:
+            return {
+                "assistant_message": (
+                    "I didn't quite catch your name. Could you tell me your "
+                    "full name?"
+                )
+            }
+        draft["customer_name"] = name
+        # Stage stays at AWAITING_CONTACT — we're still in the contact sub-flow.
+        await _save_booking_draft(state.db, conversation, draft)
+        logger.info("booking_node: contact name captured")
+        first = name.split()[0]
+        return {
+            "assistant_message": (
+                f"Thanks, {first}. What's your email address?"
+            )
+        }
+
+    # --- Collecting the email -------------------------------------------------
+    if draft.get("customer_email") is None:
+        email = _extract_email(state.user_message)
+        if email is None:
+            return {
+                "assistant_message": (
+                    "That doesn't look like a valid email address. Could you "
+                    "double-check and send it again?"
+                )
+            }
+        draft["customer_email"] = email
+        await _save_booking_draft(state.db, conversation, draft)
+        logger.info("booking_node: contact email captured")
+        return {
+            "assistant_message": (
+                "Got it. And what's the best phone number to reach you on?"
+            )
+        }
+
+    # --- Collecting the phone -------------------------------------------------
+    if draft.get("customer_phone") is None:
+        phone = _extract_phone(state.user_message)
+        if phone is None:
+            return {
+                "assistant_message": (
+                    "That doesn't look like a valid phone number. Could you "
+                    "send it again? Country code is fine."
+                )
+            }
+        draft["customer_phone"] = phone
+        draft["stage"] = STAGE_COMPLETE
+        await _save_booking_draft(state.db, conversation, draft)
+        logger.info("booking_node: contact phone captured — advancing to COMPLETE")
+
+        # 4.6.4 will create the actual Booking row here. For now, acknowledge
+        # and let the customer know the team will follow up.
+        date_iso = draft.get("requested_date", "")
+        slot_iso = draft.get("slot_start_at", "")
+        when_str = "the time you picked"
+        if slot_iso:
+            try:
+                slot_dt = datetime.fromisoformat(slot_iso)
+                when_str = (
+                    f"{slot_dt.strftime('%A, %B %d')} at "
+                    f"{slot_dt.strftime('%I:%M %p').lstrip('0')}"
+                )
+            except (TypeError, ValueError):
+                pass
+        return {
+            "assistant_message": (
+                f"Perfect — I have everything I need. The {state.business_name} "
+                f"team will reach out shortly to confirm your "
+                f"{draft.get('service_name', 'appointment')} on {when_str}. "
+                "Anything else I can help with?"
+            )
+        }
+
+    # All fields filled but stage is still AWAITING_CONTACT — shouldn't reach
+    # here in normal flow. Advance to COMPLETE defensively.
+    draft["stage"] = STAGE_COMPLETE
+    await _save_booking_draft(state.db, conversation, draft)
+    logger.warning(
+        "booking_node: awaiting_contact reached with all fields already set — advancing to COMPLETE"
+    )
+    return {
+        "assistant_message": (
+            f"Thanks! The {state.business_name} team will follow up to confirm. "
+            "Anything else I can help with?"
         )
     }
