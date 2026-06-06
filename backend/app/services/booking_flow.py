@@ -321,6 +321,38 @@ async def _load_services_by_ids(
 # Dispatcher node
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Cancellation detection (applies at any stage)
+# ---------------------------------------------------------------------------
+
+# Word-boundary regex so we don't false-reject real names containing these
+# tokens as substrings (e.g. a surname like 'Booker'). Patterns covered:
+#   - 'nevermind' / 'never mind'
+#   - 'cancel' alone, or 'cancel that/booking/the booking'
+#   - 'forget it/that/about it/about this/about the booking'
+#   - 'start over', 'begin again', 'reset'
+#   - 'no thanks' / 'no thank you'
+#   - "i don't want to" / 'i do not want to'
+_CANCEL_RE = re.compile(
+    r"\b(?:"
+    r"never\s*mind|"
+    r"cancel(?:\s+(?:that|booking|the\s+booking))?|"
+    r"forget\s+(?:it|that|about\s+(?:it|this|the\s+booking))|"
+    r"start\s+over|"
+    r"begin\s+again|"
+    r"reset|"
+    r"no\s+thanks?(?:\s+you)?|"
+    r"i\s+(?:don'?t|do\s+not)\s+want\s+(?:to|this|that)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_cancellation_intent(message: str) -> bool:
+    """True if the customer wants to abort the in-progress booking."""
+    return bool(_CANCEL_RE.search(message or ""))
+
+
 async def booking_node(state: "ChatState") -> dict:
     """Multi-stage booking flow dispatcher.
 
@@ -358,6 +390,24 @@ async def booking_node(state: "ChatState") -> dict:
         }
 
     draft = _get_booking_draft(conversation)
+
+    # Cancellation intent — clear any active draft and acknowledge. Detected
+    # at the dispatcher level so every stage handles it uniformly. Harmless
+    # if no booking is in progress: clearing an already-empty draft is a
+    # no-op, and the reply still makes sense ("cancelled that for you").
+    if _is_cancellation_intent(state.user_message):
+        await _save_booking_draft(state.db, conversation, {})
+        logger.info(
+            "booking_node: cancellation detected — cleared draft (was stage=%r)",
+            draft.get("stage"),
+        )
+        return {
+            "assistant_message": (
+                "No problem — I've cancelled that for you. "
+                "Anything else I can help with?"
+            )
+        }
+
     stage = draft.get("stage", STAGE_AWAITING_SERVICE)
 
     logger.info(
