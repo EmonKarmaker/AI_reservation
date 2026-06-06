@@ -25,20 +25,23 @@ no path through this module that allows cross-tenant data leakage.
 from __future__ import annotations
 
 import logging
+import re
+from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING
 from uuid import UUID
-
-import re
-from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.integrations.llm import LLMError, chat_completion
+from app.models.booking import Booking
 from app.models.business import Business
 from app.models.conversation import Conversation
-from app.models.enums import EmbeddingSourceType
+from app.models.customer import Customer
+from app.models.enums import BookingStatus, EmbeddingSourceType
 from app.models.service import Service
 from app.services.date_parser import parse_booking_date, today_in_business_tz
 from app.services.rag import retrieve_relevant
@@ -927,30 +930,41 @@ async def _handle_awaiting_contact(
                 )
             }
         draft["customer_phone"] = phone
+
+        # Create the actual Booking row (and update Customer) BEFORE we
+        # advance the stage. If _finalize_booking raises, draft is still
+        # at AWAITING_CONTACT with all three contact fields filled — on
+        # retry, the warning branch at the bottom of this function picks
+        # it up. Better than a half-finished state where stage=COMPLETE
+        # but no Booking row exists.
+        try:
+            booking, when_str = await _finalize_booking(
+                state, conversation, draft
+            )
+        except Exception:
+            logger.exception("booking_node: _finalize_booking failed")
+            return {
+                "assistant_message": (
+                    "Hmm — I ran into a snag finalizing your booking just "
+                    "now. Could you try once more? If it keeps happening, "
+                    f"please reach out to {state.business_name} directly."
+                )
+            }
+
+        # Booking persisted successfully — now advance the stage.
         draft["stage"] = STAGE_COMPLETE
         await _save_booking_draft(state.db, conversation, draft)
-        logger.info("booking_node: contact phone captured — advancing to COMPLETE")
+        logger.info(
+            "booking_node: booking %s created, advanced draft to COMPLETE",
+            booking.id,
+        )
 
-        # 4.6.4 will create the actual Booking row here. For now, acknowledge
-        # and let the customer know the team will follow up.
-        date_iso = draft.get("requested_date", "")
-        slot_iso = draft.get("slot_start_at", "")
-        when_str = "the time you picked"
-        if slot_iso:
-            try:
-                slot_dt = datetime.fromisoformat(slot_iso)
-                when_str = (
-                    f"{slot_dt.strftime('%A, %B %d')} at "
-                    f"{slot_dt.strftime('%I:%M %p').lstrip('0')}"
-                )
-            except (TypeError, ValueError):
-                pass
         return {
             "assistant_message": (
-                f"Perfect — I have everything I need. The {state.business_name} "
-                f"team will reach out shortly to confirm your "
-                f"{draft.get('service_name', 'appointment')} on {when_str}. "
-                "Anything else I can help with?"
+                f"You're all set! I've booked your "
+                f"{draft.get('service_name', 'appointment')} for {when_str}. "
+                f"The {state.business_name} team will reach out shortly to "
+                "confirm. Anything else I can help with?"
             )
         }
 
@@ -967,3 +981,112 @@ async def _handle_awaiting_contact(
             "Anything else I can help with?"
         )
     }
+
+
+# ---------------------------------------------------------------------------
+# Booking creation (4.6.4)
+# ---------------------------------------------------------------------------
+
+
+async def _finalize_booking(
+    state: "ChatState",
+    conversation: Conversation,
+    draft: dict,
+) -> tuple[Booking, str]:
+    """Create the Booking row, update Customer with real contact info, link
+    the booking to the conversation.
+
+    Idempotent via ``Booking.idempotency_key = f"chat:{conversation.id}"``.
+    Safe to call multiple times for the same conversation: a second call
+    returns the existing booking rather than violating the UNIQUE constraint.
+    Caller MUST have populated draft with customer_name, customer_email,
+    customer_phone, service_id, and slot_start_at.
+
+    Returns (booking, when_str) where when_str is the booking time in the
+    business's local timezone, formatted for the customer-facing reply.
+    """
+    # Fetch business (needed for timezone + currency).
+    bus_result = await state.db.execute(
+        select(Business).where(Business.id == conversation.business_id)
+    )
+    business = bus_result.scalar_one()
+
+    # Fetch service (needed for duration + price).
+    service_id = UUID(draft["service_id"])
+    svc_result = await state.db.execute(
+        select(Service).where(Service.id == service_id)
+    )
+    service = svc_result.scalar_one()
+
+    # Fetch customer (we'll update its contact info).
+    cust_result = await state.db.execute(
+        select(Customer).where(Customer.id == conversation.customer_id)
+    )
+    customer = cust_result.scalar_one()
+
+    # Update customer with real contact info. The placeholder row created
+    # on the first chat turn carried anonymous values; we replace them
+    # with what the customer told us. Assigning the same values twice is
+    # a no-op as far as SQLAlchemy is concerned, so this is safe on retry.
+    customer.full_name = draft["customer_name"]
+    customer.email = draft["customer_email"]
+    customer.phone = draft["customer_phone"]
+
+    # Convert the slot's naive local datetime to UTC TIMESTAMPTZ for storage.
+    # slot_start_at was computed in slot_finder using business-local times
+    # and serialized as a naive ISO string. We re-attach the business
+    # timezone and convert to UTC for the timezone-aware DateTime column.
+    slot_local_naive = datetime.fromisoformat(draft["slot_start_at"])
+    try:
+        business_tz = ZoneInfo(business.timezone)
+    except Exception:
+        logger.warning(
+            "Unknown business timezone %r — falling back to UTC", business.timezone
+        )
+        business_tz = ZoneInfo("UTC")
+    slot_local_aware = slot_local_naive.replace(tzinfo=business_tz)
+    starts_at_utc = slot_local_aware.astimezone(ZoneInfo("UTC"))
+    ends_at_utc = starts_at_utc + timedelta(minutes=service.duration_minutes)
+
+    # Idempotency: one chat conversation can produce at most one booking.
+    # If a booking with this key already exists (a retry after partial
+    # failure, or a duplicate submit from the client), reuse it rather
+    # than violating the UNIQUE constraint.
+    idempotency_key = f"chat:{conversation.id}"
+    existing_result = await state.db.execute(
+        select(Booking).where(Booking.idempotency_key == idempotency_key)
+    )
+    booking = existing_result.scalar_one_or_none()
+
+    if booking is None:
+        booking = Booking(
+            business_id=conversation.business_id,
+            customer_id=customer.id,
+            service_id=service.id,
+            conversation_id=conversation.id,
+            starts_at=starts_at_utc,
+            ends_at=ends_at_utc,
+            status=BookingStatus.PENDING_PAYMENT,
+            total_amount=service.price if service.price is not None else Decimal("0.00"),
+            currency=business.currency,
+            idempotency_key=idempotency_key,
+        )
+        state.db.add(booking)
+        await state.db.flush()
+        logger.info(
+            "booking_node: created Booking id=%s starts_at=%s service=%r customer=%r",
+            booking.id, starts_at_utc.isoformat(), service.name, customer.full_name,
+        )
+    else:
+        logger.info(
+            "booking_node: reusing existing Booking id=%s for idempotency_key=%s",
+            booking.id, idempotency_key,
+        )
+
+    # Human-readable time in business local timezone for the reply.
+    when_str = (
+        f"{slot_local_aware.strftime('%A, %B %d')} at "
+        f"{slot_local_aware.strftime('%I:%M %p').lstrip('0')}"
+    )
+
+    return booking, when_str
