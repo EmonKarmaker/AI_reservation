@@ -28,9 +28,14 @@ import logging
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+import re
+from datetime import datetime
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.integrations.llm import LLMError, chat_completion
 from app.models.business import Business
 from app.models.conversation import Conversation
 from app.models.enums import EmbeddingSourceType
@@ -87,16 +92,33 @@ SERVICE_SUGGESTION_CUTOFF = 0.7
 # ---------------------------------------------------------------------------
 
 def _get_booking_draft(conversation: Conversation) -> dict:
-    """Return the booking_draft sub-dict from langgraph_state. Empty if none.
+    """Return a COPY of the booking_draft sub-dict from langgraph_state.
 
     Defensive: langgraph_state has a JSONB server_default of '{}', but for
     older conversations or weird states it could theoretically be None.
+
+    CRITICAL: returns a COPY of the inner dict, not a reference. This is the
+    other half of the JSONB mutation-tracking trap (see _save_booking_draft
+    for the save-time half).
+
+    If we returned a live reference, the caller would mutate it in place
+    when they set draft["service_id"] etc. That mutation would silently
+    update SQLAlchemy's committed_state too, since committed_state holds a
+    reference to that exact dict. The next flush would then compare
+    "current == committed" by value (both holding the same mutated data)
+    and SKIP the write.
+
+    The bug is invisible on fresh conversations (langgraph_state = {} on
+    server-default, so we return a brand-new {} that's not aliased to
+    anything) but fires every time we resume an existing draft. Caller can
+    now mutate the returned dict freely; nothing persists until
+    _save_booking_draft is explicitly called.
     """
     state = conversation.langgraph_state or {}
     draft = state.get("booking_draft")
     if not isinstance(draft, dict):
-        draft = {}
-    return draft
+        return {}
+    return dict(draft)  # COPY — see CRITICAL note above
 
 
 def get_active_booking_stage(conversation: Conversation) -> str | None:
@@ -346,9 +368,11 @@ async def booking_node(state: "ChatState") -> dict:
         return await _handle_awaiting_service(state, conversation, draft)
     if stage == STAGE_AWAITING_DATE:
         return await _handle_awaiting_date(state, conversation, draft)
+    if stage == STAGE_AWAITING_SLOT:
+        return await _handle_awaiting_slot(state, conversation, draft)
 
-    # STAGE_AWAITING_SLOT, _CONTACT, and _COMPLETE will be implemented in
-    # later sub-phases (4.6.2b through 4.6.4). Polite acknowledgment for now.
+    # STAGE_AWAITING_CONTACT and _COMPLETE will be implemented in later
+    # sub-phases (4.6.3 and 4.6.4). Polite acknowledgment for now.
     return {
         "assistant_message": (
             f"Got it — I've noted that. The next part of the booking flow is "
@@ -596,5 +620,178 @@ async def _handle_awaiting_date(
             f"Great — here's what's available on "
             f"{parsed_date.strftime('%A, %B %d')}:\n\n{menu}\n\n"
             "Which time works for you?"
+        )
+    }
+
+
+# ---------------------------------------------------------------------------
+# Slot stage
+# ---------------------------------------------------------------------------
+
+_SLOT_MATCH_PROMPT = """The customer was offered these time slots:
+{options}
+
+Which slot did the customer pick? Output ONLY the slot number (one digit) or \
+the word NONE if unclear.
+
+Rules:
+- "first" / "first one" / "1st" → 1
+- "second" / "middle" / "2nd" → 2
+- "third" / "last" / "3rd" → 3 (only if 3 slots exist)
+- A specific time (e.g. "10:30 AM", "10:30", "10:30am", "the 10:30") matches \
+that slot by time
+- "any" / "any one" / "you pick" / "whatever" → 1 (first available)
+- "yes" / "ok" / "sure" / "sounds good" → 1
+- If the customer named something not in the list or is genuinely unclear, \
+output NONE
+
+Output ONLY a single digit (1-N) or NONE. No explanation, no punctuation."""
+
+
+_SLOT_NUMBER_RE = re.compile(r"\b([1-9])\b")
+
+
+def _format_slot_choices(slots: list[datetime]) -> str:
+    """Numbered list of slot times for the LLM matcher prompt."""
+    return "\n".join(
+        f"{i + 1}. {dt.strftime('%I:%M %p').lstrip('0')}"
+        for i, dt in enumerate(slots)
+    )
+
+
+def _format_slot_menu_from_iso(offered_iso: list[str]) -> str:
+    """Bullet menu used when re-presenting slots to the customer on no-match."""
+    lines: list[str] = []
+    for iso in offered_iso:
+        try:
+            dt = datetime.fromisoformat(iso)
+        except (TypeError, ValueError):
+            continue
+        lines.append(f"- {dt.strftime('%I:%M %p').lstrip('0')}")
+    return "\n".join(lines)
+
+
+async def _match_slot_choice(
+    user_message: str, offered: list[datetime]
+) -> datetime | None:
+    """Use the LLM to map the customer's text to one of the offered slots.
+
+    Returns the matched datetime, or None if the matcher couldn't confidently
+    pick. The fast model is fine here — selection among 1-3 enumerated options
+    is a simpler task than free-form date parsing.
+    """
+    if not offered:
+        return None
+
+    prompt = _SLOT_MATCH_PROMPT.format(options=_format_slot_choices(offered))
+
+    try:
+        raw = await chat_completion(
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_message},
+            ],
+            model=settings.GROQ_MODEL_FAST,
+            temperature=0.0,
+            max_tokens=10,
+        )
+    except LLMError as exc:
+        logger.warning("Slot matcher LLM call failed: %s", exc)
+        return None
+
+    cleaned = raw.strip().rstrip(".").strip("'\"")
+    if cleaned.upper() == "NONE":
+        logger.info("Slot matcher: NONE from LLM for %r", user_message[:40])
+        return None
+
+    match = _SLOT_NUMBER_RE.search(cleaned)
+    if not match:
+        logger.info("Slot matcher: no digit in LLM output %r", raw[:40])
+        return None
+
+    idx = int(match.group(1)) - 1
+    if idx < 0 or idx >= len(offered):
+        logger.info(
+            "Slot matcher: index %d out of range (%d offered)", idx, len(offered)
+        )
+        return None
+
+    chosen = offered[idx]
+    logger.info(
+        "Slot matcher: %r → slot %d (%s)", user_message[:40], idx + 1, chosen
+    )
+    return chosen
+
+
+async def _handle_awaiting_slot(
+    state: "ChatState",
+    conversation: Conversation,
+    draft: dict,
+) -> dict:
+    """Match the customer's pick to a previously-offered slot.
+
+    On success: write slot_start_at to draft, advance to awaiting_contact.
+    On match failure: re-present the slot menu.
+    On state corruption (draft has no offered_slots, or they fail to parse):
+    reset to awaiting_date so the customer can pick a date again.
+    """
+    offered_iso = draft.get("offered_slots") or []
+
+    if not offered_iso:
+        logger.warning(
+            "_handle_awaiting_slot: no offered_slots in draft — resetting to awaiting_date"
+        )
+        draft["stage"] = STAGE_AWAITING_DATE
+        draft.pop("requested_date", None)
+        draft.pop("time_window", None)
+        await _save_booking_draft(state.db, conversation, draft)
+        return {
+            "assistant_message": (
+                "Something went sideways on my end with the time options. "
+                "What date would you like to book for?"
+            )
+        }
+
+    try:
+        offered = [datetime.fromisoformat(iso) for iso in offered_iso]
+    except (TypeError, ValueError):
+        logger.warning(
+            "_handle_awaiting_slot: bad offered_slots in draft: %r", offered_iso
+        )
+        draft["stage"] = STAGE_AWAITING_DATE
+        draft.pop("offered_slots", None)
+        await _save_booking_draft(state.db, conversation, draft)
+        return {
+            "assistant_message": (
+                "Something went sideways on my end with the time options. "
+                "What date would you like to book for?"
+            )
+        }
+
+    chosen = await _match_slot_choice(state.user_message, offered)
+
+    if chosen is None:
+        menu = _format_slot_menu_from_iso(offered_iso)
+        return {
+            "assistant_message": (
+                "I didn't catch which time you wanted. Could you tell me which "
+                f"works?\n\n{menu}"
+            )
+        }
+
+    # Persist the chosen slot and advance the draft.
+    draft["slot_start_at"] = chosen.isoformat()
+    draft["stage"] = STAGE_AWAITING_CONTACT
+    await _save_booking_draft(state.db, conversation, draft)
+
+    date_str = chosen.strftime("%A, %B %d")
+    time_str = chosen.strftime("%I:%M %p").lstrip("0")
+    logger.info(
+        "booking_node: slot selected — %s at %s", date_str, time_str
+    )
+    return {
+        "assistant_message": (
+            f"Got it — {date_str} at {time_str}. To confirm the booking I "
+            "just need a few details. What's your full name?"
         )
     }
