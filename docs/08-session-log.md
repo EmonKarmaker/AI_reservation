@@ -1,5 +1,7 @@
 # Session Log — Phases 0-3 Complete; Phase 4 In Progress (4.1-4.5, 4.7 done; 4.6 + 4.8 pending)
 
+> **Superseded (2026-11-18):** current state, gotchas 24–34 and the backlog live in `CONTEXT.md` at the repo root. Phases 4.6.1–4.6.6d are done; this log stops at 4.7. Kept for history.
+
 ## What this document is
 This is the **handoff state** of the AI Reservation SaaS project. New Claude chats should read this after `CLAUDE.md` and the other 8 docs in `docs/`. It captures what's done, what decisions override the planning docs, and what's next.
 

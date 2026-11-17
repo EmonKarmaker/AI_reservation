@@ -107,12 +107,12 @@ This is **every key, password, and config value** the app needs — what each on
 
 **`GROQ_MODEL_FAST`**
 - *Purpose:* intent classification, small tasks
-- *Default:* `llama-3.1-8b-instant`
+- *Default:* `openai/gpt-oss-20b` (was `llama-3.1-8b-instant`, shut down by Groq 2026-08-16)
 - *Required for phase:* 4
 
 **`GROQ_MODEL_SMART`**
 - *Purpose:* slot extraction, judge, RAG answer
-- *Default:* `llama-3.3-70b-versatile`
+- *Default:* `openai/gpt-oss-120b` (was `llama-3.3-70b-versatile`, shut down by Groq 2026-08-16)
 - *Required for phase:* 4
 
 ### Embeddings
@@ -288,8 +288,8 @@ LOG_LEVEL=INFO
 
 # LLM
 GROQ_API_KEY=gsk_...
-GROQ_MODEL_FAST=llama-3.1-8b-instant
-GROQ_MODEL_SMART=llama-3.3-70b-versatile
+GROQ_MODEL_FAST=openai/gpt-oss-20b
+GROQ_MODEL_SMART=openai/gpt-oss-120b
 
 # Embeddings
 EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2

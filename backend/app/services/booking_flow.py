@@ -15,8 +15,14 @@ Why a single dispatcher (not a sub-graph):
 - Stages are linear and small; conditional-edge complexity isn't worth it.
 - Future refactor to a real sub-graph is straightforward if needed.
 
-Phase 4.6.1 (this commit) implements ONLY the ``awaiting_service`` stage.
-Other stages return a polite placeholder until 4.6.2+.
+All stages are implemented (4.6.1–4.6.4), plus cancellation at any stage
+(4.6.6b). Phase 4.6.5 hardened the edge cases:
+- holiday closures and special hours (schedule_exceptions) are honored;
+- the business's max_daily_bookings cap is honored;
+- a chosen slot is re-checked just before the Booking row is written, and
+  the customer is offered fresh times if someone else took it;
+- a customer can make a second booking in the same conversation (each
+  draft has its own ``draft_id`` and idempotency key).
 
 Multi-tenancy: every DB read is scoped to ``state.business_id``. There is
 no path through this module that allows cross-tenant data leakage.
@@ -29,7 +35,7 @@ import re
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -45,10 +51,15 @@ from app.models.enums import BookingStatus, EmbeddingSourceType
 from app.models.service import Service
 from app.services.date_parser import parse_booking_date, today_in_business_tz
 from app.services.rag import retrieve_relevant
-from app.services.slot_finder import Slot, extract_time_window, find_available_slots
+from app.services.slot_finder import (
+    Slot,
+    extract_time_window,
+    find_available_slots,
+    get_day_hours,
+    is_slot_still_available,
+)
 
 if TYPE_CHECKING:
-    from datetime import date as date_type
     from app.services.chat_graph import ChatState
 
 
@@ -138,6 +149,40 @@ def get_active_booking_stage(conversation: Conversation) -> str | None:
     if not stage or stage == STAGE_COMPLETE:
         return None
     return stage
+
+
+def booking_resume_prompt(conversation: Conversation) -> str | None:
+    """One line reminding the customer where their booking stands.
+
+    Appended to the answer when a customer asks a side question in the
+    middle of a booking (Phase 4.6.6d), so the conversation steers back to
+    the booking without losing what was already collected. None when no
+    booking is in progress.
+    """
+    draft = _get_booking_draft(conversation)
+    stage = draft.get("stage")
+    if not stage or stage == STAGE_COMPLETE:
+        return None
+
+    service = draft.get("service_name")
+    if stage == STAGE_AWAITING_SERVICE:
+        return "Whenever you're ready, just tell me which service you'd like to book."
+    if stage == STAGE_AWAITING_DATE:
+        what = f"your {service}" if service else "your booking"
+        return f"Whenever you're ready, what date would you like for {what}?"
+    if stage == STAGE_AWAITING_SLOT:
+        menu = _format_slot_menu_from_iso(draft.get("offered_slots") or [])
+        if menu:
+            return f"Whenever you're ready, which of these times works for you?\n\n{menu}"
+        return "Whenever you're ready, which time works for you?"
+    if stage == STAGE_AWAITING_CONTACT:
+        if draft.get("customer_name") is None:
+            return "To finish your booking, could you tell me your full name?"
+        if draft.get("customer_email") is None:
+            return "To finish your booking, what's your email address?"
+        if draft.get("customer_phone") is None:
+            return "To finish your booking, what's the best phone number to reach you on?"
+    return None
 
 
 async def _save_booking_draft(
@@ -426,14 +471,19 @@ async def booking_node(state: "ChatState") -> dict:
     if stage == STAGE_AWAITING_CONTACT:
         return await _handle_awaiting_contact(state, conversation, draft)
 
-    # STAGE_COMPLETE — actual Booking row creation lands in 4.6.4. For now,
-    # if we somehow reach this stage, give a polite acknowledgement.
-    return {
-        "assistant_message": (
-            f"Thanks! The {state.business_name} team will reach out shortly "
-            "to confirm your booking. Anything else I can help with?"
-        )
+    # STAGE_COMPLETE: the previous booking is already written (by
+    # _finalize_booking). Reaching the booking node again means the
+    # classifier saw a NEW booking request ("can I also book a filling?"),
+    # so start a fresh draft rather than acknowledging the old one.
+    # Contact details are carried over so a returning customer isn't asked
+    # for them twice.
+    fresh = {
+        k: draft[k]
+        for k in ("customer_name", "customer_email", "customer_phone")
+        if draft.get(k)
     }
+    logger.info("booking_node: previous booking complete — starting a new draft")
+    return await _handle_awaiting_service(state, conversation, fresh)
 
 
 async def _handle_awaiting_service(
@@ -449,6 +499,9 @@ async def _handle_awaiting_service(
     # like "Routine Cleaning" or "Monday" get re-classified as questions.
     if draft.get("stage") != STAGE_AWAITING_SERVICE:
         draft["stage"] = STAGE_AWAITING_SERVICE
+        # One draft_id per booking attempt; it feeds the idempotency key so
+        # one conversation can produce more than one booking.
+        draft.setdefault("draft_id", uuid4().hex)
         await _save_booking_draft(state.db, conversation, draft)
 
     matched, alternatives = await _identify_service(
@@ -625,17 +678,19 @@ async def _handle_awaiting_date(
     )
 
     if not slots:
-        # Could be: closed that day, fully booked, or window has no openings.
-        # Distinguish closed-day case for a more helpful message.
-        from app.services.slot_finder import _get_operating_hours, weekday_string
-
-        hours = await _get_operating_hours(
-            state.db, business.id, weekday_string(parsed_date)
-        )
-        if hours is None or hours.is_closed:
+        # Could be: closed that day (weekly schedule or a one-off exception
+        # such as a holiday), fully booked, or the window has no openings.
+        # Distinguish the closed-day case for a more helpful message.
+        hours = await get_day_hours(state.db, business.id, parsed_date)
+        if not hours.is_open:
+            day_label = (
+                parsed_date.strftime("%A, %B %d") if hours.reason
+                else f"{parsed_date.strftime('%A')}s"
+            )
+            reason = f" ({hours.reason})" if hours.reason else ""
             return {
                 "assistant_message": (
-                    f"We're closed on {parsed_date.strftime('%A')}. "
+                    f"We're closed on {day_label}{reason}. "
                     "What other date works for you?"
                 )
             }
@@ -843,6 +898,12 @@ async def _handle_awaiting_slot(
     logger.info(
         "booking_node: slot selected — %s at %s", date_str, time_str
     )
+
+    # Contact details already known (a second booking in the same chat, or
+    # a re-pick after the first slot was taken) — book straight away.
+    if _has_all_contact_fields(draft):
+        return await _complete_booking(state, conversation, draft)
+
     return {
         "assistant_message": (
             f"Got it — {date_str} at {time_str}. To confirm the booking I "
@@ -983,9 +1044,7 @@ async def _handle_awaiting_contact(
       STAGE_COMPLETE.
 
     On unparseable input, re-asks for the same field without advancing.
-
-    (Booking row creation happens in 4.6.4 — for now we just persist the
-    contact fields in the draft and stop with an acknowledgement.)
+    Once all three are collected, ``_complete_booking`` writes the Booking.
     """
     # --- Collecting the name --------------------------------------------------
     if draft.get("customer_name") is None:
@@ -1038,61 +1097,130 @@ async def _handle_awaiting_contact(
                 )
             }
         draft["customer_phone"] = phone
+        return await _complete_booking(state, conversation, draft)
 
-        # Create the actual Booking row (and update Customer) BEFORE we
-        # advance the stage. If _finalize_booking raises, draft is still
-        # at AWAITING_CONTACT with all three contact fields filled — on
-        # retry, the warning branch at the bottom of this function picks
-        # it up. Better than a half-finished state where stage=COMPLETE
-        # but no Booking row exists.
+    # All fields filled but stage is still AWAITING_CONTACT — e.g. a retry
+    # after _finalize_booking failed on the previous turn. Try again rather
+    # than marking the draft complete without a Booking row.
+    logger.warning(
+        "booking_node: awaiting_contact reached with all fields already set — retrying finalize"
+    )
+    return await _complete_booking(state, conversation, draft)
+
+
+def _has_all_contact_fields(draft: dict) -> bool:
+    return all(
+        draft.get(k) for k in ("customer_name", "customer_email", "customer_phone")
+    )
+
+
+class SlotUnavailableError(Exception):
+    """The chosen slot was taken (or the day closed) before we could book it."""
+
+
+async def _complete_booking(
+    state: "ChatState",
+    conversation: Conversation,
+    draft: dict,
+) -> dict:
+    """Write the Booking row and mark the draft complete.
+
+    The stage only advances to COMPLETE after the row exists. If finalizing
+    fails, the draft keeps everything it has, so the next message retries.
+    If the slot was taken in the meantime, fresh times on the same date are
+    offered (contact details are kept) or the customer is asked for a new
+    date.
+    """
+    try:
+        booking, when_str = await _finalize_booking(state, conversation, draft)
+    except SlotUnavailableError:
+        return await _reoffer_after_conflict(state, conversation, draft)
+    except Exception:
+        logger.exception("booking_node: _finalize_booking failed")
+        # The session may hold a failed flush; clear it so the reply can
+        # still be saved by save_turn_node.
         try:
-            booking, when_str = await _finalize_booking(
-                state, conversation, draft
-            )
-        except Exception:
-            logger.exception("booking_node: _finalize_booking failed")
-            return {
-                "assistant_message": (
-                    "Hmm — I ran into a snag finalizing your booking just "
-                    "now. Could you try once more? If it keeps happening, "
-                    f"please reach out to {state.business_name} directly."
-                )
-            }
-
-        # Booking persisted successfully — now advance the stage.
-        draft["stage"] = STAGE_COMPLETE
-        await _save_booking_draft(state.db, conversation, draft)
-        logger.info(
-            "booking_node: booking %s created, advanced draft to COMPLETE",
-            booking.id,
-        )
-
+            await state.db.rollback()
+        except Exception:  # noqa: BLE001
+            logger.warning("booking_node: rollback after finalize failure also failed")
         return {
             "assistant_message": (
-                f"You're all set! I've booked your "
-                f"{draft.get('service_name', 'appointment')} for {when_str}. "
-                f"The {state.business_name} team will reach out shortly to "
-                "confirm. Anything else I can help with?"
+                "Hmm — I ran into a snag finalizing your booking just "
+                "now. Could you try once more? If it keeps happening, "
+                f"please reach out to {state.business_name} directly."
             )
         }
 
-    # All fields filled but stage is still AWAITING_CONTACT — shouldn't reach
-    # here in normal flow. Advance to COMPLETE defensively.
     draft["stage"] = STAGE_COMPLETE
     await _save_booking_draft(state.db, conversation, draft)
-    logger.warning(
-        "booking_node: awaiting_contact reached with all fields already set — advancing to COMPLETE"
+    logger.info(
+        "booking_node: booking %s created, advanced draft to COMPLETE",
+        booking.id,
     )
     return {
         "assistant_message": (
-            f"Thanks! The {state.business_name} team will follow up to confirm. "
-            "Anything else I can help with?"
+            f"You're all set! I've booked your "
+            f"{draft.get('service_name', 'appointment')} for {when_str}. "
+            f"The {state.business_name} team will reach out shortly to "
+            "confirm. Anything else I can help with?"
+        )
+    }
+
+
+async def _reoffer_after_conflict(
+    state: "ChatState",
+    conversation: Conversation,
+    draft: dict,
+) -> dict:
+    """The chosen slot went away — offer what's left that day, or a new date."""
+    taken = datetime.fromisoformat(draft["slot_start_at"])
+    taken_str = taken.strftime("%I:%M %p").lstrip("0")
+    draft.pop("slot_start_at", None)
+
+    business = await _load_business(state.db, state.business_id)
+    service = await _load_service(state.db, state.business_id, draft.get("service_id", ""))
+    slots: list[Slot] = []
+    if business is not None and service is not None:
+        slots = await find_available_slots(
+            state.db,
+            business=business,
+            service=service,
+            target_date=taken.date(),
+            time_window=draft.get("time_window"),
+            limit=3,
+        )
+
+    if slots:
+        draft["offered_slots"] = [sl.iso for sl in slots]
+        draft["stage"] = STAGE_AWAITING_SLOT
+        await _save_booking_draft(state.db, conversation, draft)
+        logger.info("booking_node: slot %s was taken — re-offered %d slots", taken, len(slots))
+        return {
+            "assistant_message": (
+                f"Sorry — {taken_str} was just taken. Here's what's still open on "
+                f"{taken.strftime('%A, %B %d')}:\n\n{_format_slot_menu(slots)}\n\n"
+                "Which time works for you?"
+            )
+        }
+
+    draft["stage"] = STAGE_AWAITING_DATE
+    draft.pop("offered_slots", None)
+    draft.pop("requested_date", None)
+    await _save_booking_draft(state.db, conversation, draft)
+    logger.info(
+        "booking_node: slot %s was taken and the day is full — asking for a new date", taken
+    )
+    return {
+        "assistant_message": (
+            f"Sorry — {taken_str} was just taken and "
+            f"{taken.strftime('%A, %B %d')} is now fully booked. "
+            "Could you pick another date?"
         )
     }
 
 
 # ---------------------------------------------------------------------------
-# Booking creation (4.6.4)
+# Booking creation (4.6.4, hardened in 4.6.5)
 # ---------------------------------------------------------------------------
 
 
@@ -1104,9 +1232,14 @@ async def _finalize_booking(
     """Create the Booking row, update Customer with real contact info, link
     the booking to the conversation.
 
-    Idempotent via ``Booking.idempotency_key = f"chat:{conversation.id}"``.
-    Safe to call multiple times for the same conversation: a second call
-    returns the existing booking rather than violating the UNIQUE constraint.
+    Idempotent via ``Booking.idempotency_key``: ``chat:{conversation.id}:
+    {draft_id}`` (or ``chat:{conversation.id}`` for drafts started before
+    draft_id existed). Safe to call multiple times for the same draft: a
+    second call returns the existing booking rather than violating the
+    UNIQUE constraint.
+
+    Raises SlotUnavailableError if the slot was taken (or the day closed)
+    since it was offered.
     Caller MUST have populated draft with customer_name, customer_email,
     customer_phone, service_id, and slot_start_at.
 
@@ -1119,10 +1252,13 @@ async def _finalize_booking(
     )
     business = bus_result.scalar_one()
 
-    # Fetch service (needed for duration + price).
+    # Fetch service (needed for duration + price). Scoped to this tenant.
     service_id = UUID(draft["service_id"])
     svc_result = await state.db.execute(
-        select(Service).where(Service.id == service_id)
+        select(Service).where(
+            Service.id == service_id,
+            Service.business_id == conversation.business_id,
+        )
     )
     service = svc_result.scalar_one()
 
@@ -1160,13 +1296,32 @@ async def _finalize_booking(
     # If a booking with this key already exists (a retry after partial
     # failure, or a duplicate submit from the client), reuse it rather
     # than violating the UNIQUE constraint.
-    idempotency_key = f"chat:{conversation.id}"
+    draft_id = draft.get("draft_id")
+    idempotency_key = (
+        f"chat:{conversation.id}:{draft_id}" if draft_id else f"chat:{conversation.id}"
+    )
     existing_result = await state.db.execute(
         select(Booking).where(Booking.idempotency_key == idempotency_key)
     )
     booking = existing_result.scalar_one_or_none()
 
     if booking is None:
+        # Re-check right before writing: the slot was offered a few turns
+        # ago and someone else may have taken it since.
+        still_free = await is_slot_still_available(
+            state.db,
+            business=business,
+            service=service,
+            slot_start_local=slot_local_naive,
+        )
+        if not still_free:
+            logger.info(
+                "booking_node: slot %s no longer available for conversation %s",
+                slot_local_naive,
+                conversation.id,
+            )
+            raise SlotUnavailableError(slot_local_naive.isoformat())
+
         booking = Booking(
             business_id=conversation.business_id,
             customer_id=customer.id,
@@ -1180,6 +1335,8 @@ async def _finalize_booking(
             idempotency_key=idempotency_key,
         )
         state.db.add(booking)
+        await state.db.flush()
+        conversation.booking_id = booking.id
         await state.db.flush()
         logger.info(
             "booking_node: created Booking id=%s starts_at=%s service=%r customer=%r",

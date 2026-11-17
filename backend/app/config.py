@@ -33,9 +33,12 @@ class Settings(BaseSettings):
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     # LLM (Groq) — required from Phase 4
+    # Groq shut down llama-3.1-8b-instant and llama-3.3-70b-versatile on
+    # 2026-08-16 and named these as the replacements. Both are reasoning
+    # models; app/integrations/llm.py handles that.
     GROQ_API_KEY: str = ""
-    GROQ_MODEL_FAST: str = "llama-3.1-8b-instant"
-    GROQ_MODEL_SMART: str = "llama-3.3-70b-versatile"
+    GROQ_MODEL_FAST: str = "openai/gpt-oss-20b"
+    GROQ_MODEL_SMART: str = "openai/gpt-oss-120b"
 
     # Embeddings — required from Phase 3
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"

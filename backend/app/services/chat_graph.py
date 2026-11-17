@@ -1,12 +1,19 @@
-"""LangGraph chat receptionist (Phase 4.5 — intent-routed).
+"""LangGraph chat receptionist (intent-routed).
 
 Graph layout:
 
     load_history → classify_intent → [router] → one of:
         question  → retrieve → answer
-        booking   → booking_stub
-        escalate  → escalate_stub
+        booking   → booking            (booking_flow.booking_node)
+        escalate  → escalate_stub      (sends the escalation email, 4.8)
     → save_turn → END
+
+Mid-booking routing (4.6.6d): while a booking draft is active, short
+answers ("Saturday", "10:30", "John") are forced into the booking flow
+even if the classifier calls them questions. A clear side question
+("how long does a root canal take?") is answered from RAG instead, and the
+answer ends with a reminder of the pending booking step. The draft is not
+touched, so the next message picks the booking up where it left off.
 
 Multi-tenancy: business_id is REQUIRED in state. retrieve_relevant filters
 by it and the system prompt tells the LLM to ground on the provided context
@@ -19,6 +26,7 @@ module-level singleton; only per-request state is fresh.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 from uuid import UUID
@@ -93,6 +101,9 @@ class ChatState:
     # Populated by load_history_node when a booking is mid-flow. None means
     # no active draft. Used by classify_intent_node for sticky routing.
     booking_stage: str | None = None
+    # One-line nudge back to the pending booking step, appended to answers
+    # given to side questions asked mid-booking. None when no draft.
+    booking_resume_prompt: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +117,7 @@ async def load_history_node(state: ChatState) -> dict:
     langgraph_state so downstream nodes (classify_intent) can decide whether
     to apply sticky routing.
     """
-    from app.services.booking_flow import get_active_booking_stage
+    from app.services.booking_flow import booking_resume_prompt, get_active_booking_stage
 
     conversation = await get_or_create_conversation(
         state.db,
@@ -118,6 +129,7 @@ async def load_history_node(state: ChatState) -> dict:
         conversation_id=conversation.id,
     )
     booking_stage = get_active_booking_stage(conversation)
+    resume_prompt = booking_resume_prompt(conversation) if booking_stage else None
     logger.info(
         "Loaded conversation=%s with %d prior messages (booking_stage=%r)",
         conversation.id,
@@ -128,6 +140,7 @@ async def load_history_node(state: ChatState) -> dict:
         "conversation_id": conversation.id,
         "history": history,
         "booking_stage": booking_stage,
+        "booking_resume_prompt": resume_prompt,
     }
 
 
@@ -194,6 +207,47 @@ def _parse_intent(raw: str) -> Intent:
     return DEFAULT_INTENT
 
 
+# --- Side questions during an active booking (4.6.6d) ----------------------
+
+_QUESTION_START_RE = re.compile(
+    r"^\s*(?:what|what's|whats|how|do|does|did|is|are|can|could|will|would|"
+    r"where|when|why|which|who|should|any)\b",
+    re.IGNORECASE,
+)
+
+# Things that make a message look like an ANSWER to a booking step even if
+# it is phrased as a question: dates, weekdays, times of day, numbers,
+# emails. "Can I come Saturday?" or "is 10:30 free?" belong to the booking.
+_BOOKING_ANSWER_HINT_RE = re.compile(
+    r"\d|@|\b(?:today|tonight|tomorrow|tmrw|morning|afternoon|evening|noon|"
+    r"weekend|week|month|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|"
+    r"january|february|march|april|june|july|august|september|october|"
+    r"november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec|"
+    r"first|second|third|last|earlier|later|"
+    r"slot|slots|times|available|availability)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_side_question(message: str) -> bool:
+    """True if a mid-booking message is a genuine side question.
+
+    Deterministic, no LLM. A side question must look like a question (a
+    question mark or a leading question word), have at least three words,
+    and contain nothing that answers a booking step (dates, weekdays,
+    times, numbers, emails, slot words). When in doubt we say False, which
+    keeps the old behavior: the message goes to the booking flow.
+    """
+    text = (message or "").strip()
+    if len(text.split()) < 3:
+        return False
+    if "?" not in text and not _QUESTION_START_RE.match(text):
+        return False
+    return not _BOOKING_ANSWER_HINT_RE.search(text)
+
+
 async def classify_intent_node(state: ChatState) -> dict:
     """Classify the customer's intent using the fast Groq model."""
     from app.config import settings
@@ -226,7 +280,18 @@ async def classify_intent_node(state: ChatState) -> dict:
     # answers like "Saturday" or "10:30 AM" can otherwise look like questions
     # to the classifier. We deliberately do NOT override "escalate" — an
     # angry customer must always be able to break out of a booking.
-    if intent == "question" and state.booking_stage:
+    # Exception (4.6.6d): a clear side question is answered as a question;
+    # answer_node then reminds the customer of the pending booking step.
+    if (
+        intent == "question"
+        and state.booking_stage
+        and looks_like_side_question(state.user_message)
+    ):
+        logger.info(
+            "Side question during booking (stage=%s) — answering, draft kept",
+            state.booking_stage,
+        )
+    elif intent == "question" and state.booking_stage:
         logger.info(
             "Sticky booking: overriding question → booking (stage=%s)",
             state.booking_stage,
@@ -317,10 +382,16 @@ async def answer_node(state: ChatState) -> dict:
             "in a moment, or contact us directly?"
         )
 
+    # Mid-booking side question: steer back to the pending booking step.
+    if state.booking_stage and state.booking_resume_prompt:
+        reply = f"{reply.rstrip()}\n\n{state.booking_resume_prompt}"
+
     return {"assistant_message": reply}
 
 
-# --- Escalate stub (replaced in Phase 4.8) ---------------------------------
+# --- Escalation (Phase 4.8: sends a real email via Resend) ------------------
+# The node keeps its original name, escalate_stub_node, so graph node ids
+# and log lines stay stable.
 
 def _format_escalation_email(state: ChatState) -> tuple[str, str]:
     """Compose (subject, html) for the escalation email.

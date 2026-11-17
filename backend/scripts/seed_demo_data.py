@@ -76,6 +76,10 @@ class DemoBusiness:
     admin_full_name: str
     services: list[DemoService] = field(default_factory=list)
     faqs: list[DemoFaq] = field(default_factory=list)
+    # All demo businesses are in Bangladesh and price in taka. Without this
+    # the row takes the column's server_default ("USD"), which is the bug
+    # scripts/fix_demo_data.py was written to patch.
+    currency: str = "BDT"
 
 
 DHAKA_DENTAL = DemoBusiness(
@@ -212,6 +216,7 @@ async def _seed_one_business(
         name=demo.name,
         industry=demo.industry,
         timezone=demo.timezone_name,
+        currency=demo.currency,
         status=BusinessStatus.ACTIVE,
     )
     session.add(business)

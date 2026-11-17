@@ -8,15 +8,16 @@ You are the coding assistant for a multi-tenant AI receptionist SaaS project. Yo
 
 Read these in order before writing code or answering questions about the project:
 
+0. `CONTEXT.md` (repo root) — **read this FIRST, every session.** Current phase, the real file tree, all gotchas, backlog. It is newer than everything in `docs/`.
 1. `docs/00-overview.md` — what we're building, tech stack (locked), non-negotiables
 2. `docs/01-schema.md` — complete database schema (17 tables)
 3. `docs/02-langgraph.md` — AI receptionist state machine design
 4. `docs/03-api.md` — every REST endpoint and its contract
-5. `docs/04-folder-structure.md` — exact folder layout
+5. `docs/04-folder-structure.md` — the ORIGINAL planned layout; the real tree differs (see `CONTEXT.md` §8)
 6. `docs/05-build-phases.md` — what to build in what order
 7. `docs/06-env-vars.md` — every secret/config value
 8. `docs/07-conventions.md` — coding style rules
-9. `docs/08-session-log.md` — current state, decisions overriding earlier docs, gotchas
+9. `docs/08-session-log.md` — history up to Phase 4.7; superseded by `CONTEXT.md` for current state
 
 If the user asks you to do something, first confirm which document or phase it relates to.
 
@@ -29,6 +30,12 @@ If the user asks you to do something, first confirm which document or phase it r
 **Frontend:** Next.js 16 App Router + TypeScript strict + Tailwind v4 + shadcn/ui + Zustand + TanStack Query + React Hook Form + Zod + Tremor + Recharts + assistant-ui + @vapi-ai/web + Lucide + Framer Motion.
 
 **Infra:** Supabase (Postgres + pgvector + Storage) + Render/Fly.io (backend) + Vercel (frontend).
+
+**Status:** not installed yet — backend LangChain, APScheduler, Stripe, Vapi; frontend TanStack Query, Tremor, Recharts, assistant-ui, @vapi-ai/web, Framer Motion. Add each only in the phase that needs it.
+
+**Groq models:** `openai/gpt-oss-20b` (fast) and `openai/gpt-oss-120b` (smart). The original Llama models were shut down by Groq on 2026-08-16. These are reasoning models; `app/integrations/llm.py` handles their token budget — always call the LLM through `chat_completion`.
+
+**Known deviations from the plan:** LangGraph lives in `app/services/` (`chat_graph.py`, `booking_flow.py`), not `app/ai/`. Admin routers query the DB directly. Treat the real tree in `CONTEXT.md` §8 as the truth.
 
 Never suggest MongoDB, Prisma, tRPC, Clerk, OpenAI, Cloudinary, Django, Flask, Vite, Redux, or any framework switch. If you think a swap is needed, ask first.
 
@@ -67,11 +74,9 @@ Never suggest MongoDB, Prisma, tRPC, Clerk, OpenAI, Cloudinary, Django, Flask, V
 
 ## Current phase
 
-Phase 0 is COMPLETE. Phase 1 is next.
+The current phase and next task live in `CONTEXT.md` §1. Do not rely on any phase named in this file.
 
-See `docs/08-session-log.md` for exact state and Phase 1 sub-phase breakdown (1.1 through 1.8).
-
-When the user says "start Phase 1.X", re-read that sub-phase's scope and confirm before coding.
+When the user says "start Phase X.Y", re-read that phase's scope (`CONTEXT.md` §10 and `docs/05-build-phases.md`) and confirm before coding.
 
 ---
 
@@ -123,7 +128,7 @@ Never dump an entire phase's worth of code in one response. Work in small, revie
 
 ## Starting work
 
-On your first response in a new session, confirm you've read all 9 docs by summarizing:
+On your first response in a new session, confirm you've read `CONTEXT.md` and the docs by summarizing:
 1. What we're building (one sentence)
 2. The current phase and what sub-task comes first
 3. Any setup the user still needs to do before you can proceed

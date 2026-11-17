@@ -4,15 +4,24 @@ Given a service, a target date, and (optionally) a time-of-day preference,
 returns up to N available start times on that date.
 
 Algorithm:
-1. Look up the business's operating_hours for the date's weekday.
-2. Generate a 30-minute grid of candidate start times from open_time to
-   (close_time - service.duration_minutes).
-3. Look up existing bookings for that date in active statuses
+1. Resolve the day's hours: a schedule_exceptions row for that exact date
+   (holiday closure or special hours) wins over the weekly
+   operating_hours row for the weekday.
+2. If business_settings.max_daily_bookings is set and the day already has
+   that many active bookings, the day is full.
+3. Generate a 30-minute grid of candidate start times from open_time to
+   (close_time - service.duration_minutes - buffer).
+4. Look up existing bookings for that date in active statuses
    (PENDING_PAYMENT, CONFIRMED).
-4. Drop candidate slots that overlap any existing booking (taking
-   service.buffer_minutes into account).
-5. Filter by time_window if specified ("morning" / "afternoon" / "evening").
-6. Return the first `limit` survivors.
+5. Drop candidate slots that overlap any existing booking (taking
+   service.buffer_minutes into account) or that are already in the past.
+6. Filter by time_window if specified ("morning" / "afternoon" / "evening").
+7. Return the first `limit` survivors.
+
+The pure part (steps 3, 5, 6, 7) lives in ``compute_slots`` so it can be
+unit-tested without a database. ``is_slot_still_available`` re-runs the
+same checks for one chosen start time just before a booking is written,
+so a slot taken by another customer in the meantime is caught.
 
 All times in this module are NAIVE LOCAL times in the business's timezone.
 Conversion to UTC happens at the booking-creation boundary (Phase 4.6.4),
@@ -27,13 +36,15 @@ from datetime import date, datetime, time, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.booking import Booking
 from app.models.business import Business
+from app.models.business_setting import BusinessSetting
 from app.models.enums import BookingStatus
 from app.models.operating_hours import OperatingHours
+from app.models.schedule_exception import ScheduleException
 from app.models.service import Service
 
 
@@ -76,6 +87,21 @@ class Slot:
         return self.start_local.isoformat()
 
 
+@dataclass(slots=True)
+class DayHours:
+    """Resolved opening hours for one calendar date.
+
+    ``is_open`` False means no bookings that day. ``reason`` carries the
+    schedule-exception reason (e.g. "Eid holiday") when there is one, so the
+    chatbot can explain the closure.
+    """
+
+    is_open: bool
+    open_time: time | None = None
+    close_time: time | None = None
+    reason: str | None = None
+
+
 def weekday_string(d: date) -> str:
     """Convert a date to the 3-letter weekday key used in operating_hours."""
     return _WEEKDAY_TO_DOW[d.weekday()]
@@ -108,6 +134,93 @@ async def _get_operating_hours(
     return result.scalar_one_or_none()
 
 
+async def _get_schedule_exception(
+    db: AsyncSession, business_id: UUID, target_date: date
+) -> ScheduleException | None:
+    result = await db.execute(
+        select(ScheduleException).where(
+            ScheduleException.business_id == business_id,
+            ScheduleException.exception_date == target_date,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+def resolve_hours(
+    weekly: OperatingHours | None,
+    exception: ScheduleException | None,
+) -> DayHours:
+    """Combine the weekly schedule with a one-off exception for one date.
+
+    Pure function. Rules:
+    - An exception row for the date always wins.
+      - ``is_closed`` (or missing / inverted times) -> closed that day.
+      - otherwise -> open with the exception's special hours.
+    - No exception: fall back to the weekly row; missing or ``is_closed``
+      means closed.
+    """
+    if exception is not None:
+        reason = (exception.reason or "").strip() or None
+        if (
+            exception.is_closed
+            or exception.open_time is None
+            or exception.close_time is None
+            or exception.close_time <= exception.open_time
+        ):
+            return DayHours(is_open=False, reason=reason)
+        return DayHours(
+            is_open=True,
+            open_time=exception.open_time,
+            close_time=exception.close_time,
+            reason=reason,
+        )
+
+    if weekly is None or weekly.is_closed:
+        return DayHours(is_open=False)
+    return DayHours(is_open=True, open_time=weekly.open_time, close_time=weekly.close_time)
+
+
+async def get_day_hours(
+    db: AsyncSession, business_id: UUID, target_date: date
+) -> DayHours:
+    """Opening hours for ``target_date``, honoring schedule exceptions."""
+    weekly = await _get_operating_hours(db, business_id, weekday_string(target_date))
+    exception = await _get_schedule_exception(db, business_id, target_date)
+    return resolve_hours(weekly, exception)
+
+
+async def _get_max_daily_bookings(db: AsyncSession, business_id: UUID) -> int | None:
+    result = await db.execute(
+        select(BusinessSetting.max_daily_bookings).where(
+            BusinessSetting.business_id == business_id
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+def _local_day_bounds(target_date: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
+    """[start, end) of ``target_date`` in business-local time, tz-aware."""
+    day_start = datetime.combine(target_date, time(0, 0), tzinfo=tz)
+    day_end = datetime.combine(target_date + timedelta(days=1), time(0, 0), tzinfo=tz)
+    return day_start, day_end
+
+
+async def _count_blocking_bookings_for_day(
+    db: AsyncSession, business_id: UUID, target_date: date, tz: ZoneInfo
+) -> int:
+    day_start, day_end = _local_day_bounds(target_date, tz)
+    result = await db.execute(
+        select(func.count(Booking.id)).where(
+            Booking.business_id == business_id,
+            Booking.status.in_(_BLOCKING_STATUSES),
+            Booking.deleted_at.is_(None),
+            Booking.starts_at >= day_start,
+            Booking.starts_at < day_end,
+        )
+    )
+    return int(result.scalar_one())
+
+
 async def _get_blocking_bookings_for_day(
     db: AsyncSession,
     business_id: UUID,
@@ -115,19 +228,19 @@ async def _get_blocking_bookings_for_day(
     tz: ZoneInfo,
 ) -> list[Booking]:
     """Bookings on `target_date` whose status blocks new slots."""
-    # Day boundaries in business-local time, converted to UTC for the DB.
-    # We use TZ-aware datetimes so the comparison is unambiguous regardless
-    # of how the DB stores the column.
-    day_start = datetime.combine(target_date, time(0, 0, 0), tzinfo=tz)
-    day_end = datetime.combine(target_date, time(23, 59, 59), tzinfo=tz)
+    # Day boundaries in business-local time. TZ-aware datetimes keep the
+    # comparison unambiguous regardless of how the DB stores the column.
+    # Matching on overlap with the day (not just starts_at) also catches a
+    # booking that started before midnight and runs into this day.
+    day_start, day_end = _local_day_bounds(target_date, tz)
 
     result = await db.execute(
         select(Booking).where(
             Booking.business_id == business_id,
             Booking.status.in_(_BLOCKING_STATUSES),
             Booking.deleted_at.is_(None),
-            Booking.starts_at >= day_start,
-            Booking.starts_at <= day_end,
+            Booking.starts_at < day_end,
+            Booking.ends_at > day_start,
         )
     )
     return list(result.scalars().all())
@@ -161,6 +274,92 @@ def _generate_grid(
     return starts
 
 
+def _to_local_naive(dt: datetime, tz: ZoneInfo) -> datetime:
+    """Convert a stored booking timestamp to naive business-local time."""
+    if dt.tzinfo is not None:
+        return dt.astimezone(tz).replace(tzinfo=None)
+    return dt  # naive: assume already business-local
+
+
+def _busy_intervals(
+    bookings: list[Booking], tz: ZoneInfo, buffer_minutes: int
+) -> list[tuple[datetime, datetime]]:
+    """Existing bookings as naive-local [start, end + buffer) intervals.
+
+    The buffer is applied to the END of each existing booking too: a new
+    slot must not start during another booking's buffer-out window.
+    """
+    pad = timedelta(minutes=buffer_minutes)
+    return [
+        (_to_local_naive(b.starts_at, tz), _to_local_naive(b.ends_at, tz) + pad)
+        for b in bookings
+    ]
+
+
+def compute_slots(
+    *,
+    target_date: date,
+    open_time: time,
+    close_time: time,
+    duration_minutes: int,
+    buffer_minutes: int,
+    busy_intervals: list[tuple[datetime, datetime]],
+    now_local: datetime,
+    time_window: str | None = None,
+    limit: int = 3,
+) -> list[Slot]:
+    """Pure slot computation. No DB, no clock — everything is passed in."""
+    if limit <= 0:
+        return []
+
+    block_minutes = duration_minutes + buffer_minutes
+    grid = _generate_grid(
+        target_date=target_date,
+        open_time=open_time,
+        close_time=close_time,
+        duration_minutes=block_minutes,
+    )
+
+    window = _TIME_WINDOWS.get(time_window) if time_window else None
+
+    survivors: list[Slot] = []
+    for slot_start in grid:
+        slot_end = slot_start + timedelta(minutes=block_minutes)
+
+        if slot_start <= now_local:
+            continue  # in the past or right now — not bookable
+
+        if any(_overlaps(slot_start, slot_end, bs, be) for bs, be in busy_intervals):
+            continue
+
+        if window is not None:
+            w_start, w_end = window
+            if not (w_start <= slot_start.time() < w_end):
+                continue
+
+        survivors.append(
+            Slot(
+                start_local=slot_start,
+                end_local=slot_start + timedelta(minutes=duration_minutes),
+            )
+        )
+        if len(survivors) >= limit:
+            break
+
+    return survivors
+
+
+def _business_tz(business: Business) -> ZoneInfo:
+    try:
+        return ZoneInfo(business.timezone)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Unknown business timezone %r; using UTC for booking lookups",
+            business.timezone,
+        )
+        return ZoneInfo("UTC")
+
+
 async def find_available_slots(
     db: AsyncSession,
     *,
@@ -172,105 +371,50 @@ async def find_available_slots(
 ) -> list[Slot]:
     """Return up to `limit` available slots for `service` on `target_date`.
 
-    Returns [] if the business is closed that day, has no hours configured,
-    or every candidate slot conflicts with an existing booking.
+    Returns [] if the business is closed that day (weekly schedule or a
+    schedule exception), the daily booking cap is reached, or every
+    candidate slot conflicts with an existing booking.
     """
     if limit <= 0:
         return []
 
-    try:
-        tz = ZoneInfo(business.timezone)
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "Unknown business timezone %r; using UTC for booking lookups",
-            business.timezone,
-        )
-        tz = ZoneInfo("UTC")
+    tz = _business_tz(business)
 
-    dow = weekday_string(target_date)
-    hours = await _get_operating_hours(db, business.id, dow)
-    if hours is None or hours.is_closed:
+    hours = await get_day_hours(db, business.id, target_date)
+    if not hours.is_open or hours.open_time is None or hours.close_time is None:
         logger.info(
-            "find_available_slots: business=%s closed on %s (%s)",
+            "find_available_slots: business=%s closed on %s (reason=%r)",
             business.id,
             target_date,
-            dow,
+            hours.reason,
         )
         return []
 
-    # Block size for conflict purposes = service duration + buffer
-    block_minutes = service.duration_minutes + (service.buffer_minutes or 0)
+    max_daily = await _get_max_daily_bookings(db, business.id)
+    if max_daily is not None:
+        booked = await _count_blocking_bookings_for_day(db, business.id, target_date, tz)
+        if booked >= max_daily:
+            logger.info(
+                "find_available_slots: business=%s at daily cap on %s (%d/%d)",
+                business.id,
+                target_date,
+                booked,
+                max_daily,
+            )
+            return []
 
-    grid = _generate_grid(
+    bookings = await _get_blocking_bookings_for_day(db, business.id, target_date, tz)
+    survivors = compute_slots(
         target_date=target_date,
         open_time=hours.open_time,
         close_time=hours.close_time,
-        duration_minutes=block_minutes,
+        duration_minutes=service.duration_minutes,
+        buffer_minutes=service.buffer_minutes or 0,
+        busy_intervals=_busy_intervals(bookings, tz, service.buffer_minutes or 0),
+        now_local=datetime.now(tz=tz).replace(tzinfo=None),
+        time_window=time_window,
+        limit=limit,
     )
-    if not grid:
-        logger.info(
-            "find_available_slots: no grid slots — open=%s close=%s block=%dm",
-            hours.open_time,
-            hours.close_time,
-            block_minutes,
-        )
-        return []
-
-    # Existing bookings on this date. We compare against the booking's actual
-    # [starts_at, ends_at] interval, not block_minutes — the buffer applies to
-    # the *new* slot, not the stored row.
-    bookings = await _get_blocking_bookings_for_day(
-        db, business.id, target_date, tz
-    )
-
-    # Convert bookings to naive local datetimes for comparison with the grid.
-    busy_intervals: list[tuple[datetime, datetime]] = []
-    for b in bookings:
-        # If starts_at/ends_at are tz-aware (TIMESTAMPTZ), convert to local.
-        # If naive, assume they're already in business-local time (no other
-        # sensible interpretation given the schema).
-        bs = b.starts_at
-        be = b.ends_at
-        if bs.tzinfo is not None:
-            bs = bs.astimezone(tz).replace(tzinfo=None)
-        if be.tzinfo is not None:
-            be = be.astimezone(tz).replace(tzinfo=None)
-        # Apply buffer to the END of existing booking too — the new slot must
-        # not start during another booking's buffer-out window.
-        be_padded = be + timedelta(minutes=service.buffer_minutes or 0)
-        busy_intervals.append((bs, be_padded))
-
-    # Now exclude (a) past slots if target_date is today, (b) conflicts.
-    now_local = datetime.now(tz=tz).replace(tzinfo=None)
-
-    survivors: list[Slot] = []
-    for slot_start in grid:
-        slot_end = slot_start + timedelta(minutes=block_minutes)
-
-        if slot_start <= now_local:
-            continue  # in the past or right now — not bookable
-
-        conflict = any(
-            _overlaps(slot_start, slot_end, bs, be) for bs, be in busy_intervals
-        )
-        if conflict:
-            continue
-
-        if time_window:
-            window = _TIME_WINDOWS.get(time_window)
-            if window is not None:
-                w_start, w_end = window
-                if not (w_start <= slot_start.time() < w_end):
-                    continue
-
-        survivors.append(
-            Slot(
-                start_local=slot_start,
-                end_local=slot_start + timedelta(minutes=service.duration_minutes),
-            )
-        )
-        if len(survivors) >= limit:
-            break
 
     logger.info(
         "find_available_slots: business=%s service=%r date=%s window=%r → %d slots",
@@ -281,3 +425,48 @@ async def find_available_slots(
         len(survivors),
     )
     return survivors
+
+
+async def is_slot_still_available(
+    db: AsyncSession,
+    *,
+    business: Business,
+    service: Service,
+    slot_start_local: datetime,
+) -> bool:
+    """Re-check one chosen start time right before a booking is written.
+
+    Minutes can pass between offering a slot and the customer finishing
+    their contact details; another customer may have taken it, or the
+    admin may have closed the day. This re-runs the same rules as
+    ``find_available_slots`` for exactly that start time.
+
+    Note: this narrows the race window but cannot close it completely —
+    two transactions checking at the same instant can both see the slot as
+    free. A Postgres exclusion constraint on bookings would close it fully.
+    """
+    tz = _business_tz(business)
+    target_date = slot_start_local.date()
+
+    hours = await get_day_hours(db, business.id, target_date)
+    if not hours.is_open or hours.open_time is None or hours.close_time is None:
+        return False
+
+    max_daily = await _get_max_daily_bookings(db, business.id)
+    if max_daily is not None:
+        booked = await _count_blocking_bookings_for_day(db, business.id, target_date, tz)
+        if booked >= max_daily:
+            return False
+
+    bookings = await _get_blocking_bookings_for_day(db, business.id, target_date, tz)
+    candidates = compute_slots(
+        target_date=target_date,
+        open_time=hours.open_time,
+        close_time=hours.close_time,
+        duration_minutes=service.duration_minutes,
+        buffer_minutes=service.buffer_minutes or 0,
+        busy_intervals=_busy_intervals(bookings, tz, service.buffer_minutes or 0),
+        now_local=datetime.now(tz=tz).replace(tzinfo=None),
+        limit=10_000,
+    )
+    return any(c.start_local == slot_start_local for c in candidates)

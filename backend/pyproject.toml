@@ -28,10 +28,15 @@ dependencies = [
     "python-jose[cryptography]>=3.3.0",
     "bcrypt>=4.0.0",
 
-# Encryption
+    # Encryption
     "cryptography>=42.0.0",
+
     # Vector DB
     "pgvector>=0.3.0",
+
+    # Timezone data — Windows has no system tz database, so zoneinfo
+    # needs this package to resolve "Asia/Dhaka" etc.
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
@@ -71,6 +76,7 @@ exclude = ["tests/", "alembic/", "scripts/"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]

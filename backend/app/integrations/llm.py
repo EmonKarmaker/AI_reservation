@@ -2,13 +2,23 @@
 
 Two model tiers, both configured via settings:
 
-- ``GROQ_MODEL_FAST``  (default: llama-3.1-8b-instant) — for intent
-  classification, slot extraction, and other latency-sensitive low-stakes
-  calls. ~1 s response time on simple prompts.
+- ``GROQ_MODEL_FAST``  (default: openai/gpt-oss-20b) — for slot matching
+  and other latency-sensitive low-stakes calls.
 
-- ``GROQ_MODEL_SMART`` (default: llama-3.3-70b-versatile) — for question
-  answering, drafting messages, anything that needs reasoning over the
-  business's services + FAQs. ~2-4 s response time.
+- ``GROQ_MODEL_SMART`` (default: openai/gpt-oss-120b) — for intent
+  classification, date parsing, question answering, anything that needs
+  reasoning over the business's services + FAQs.
+
+The original Llama defaults (llama-3.1-8b-instant / llama-3.3-70b-versatile)
+were shut down by Groq on 2026-08-16.
+
+Reasoning models: gpt-oss (and Qwen3) "think" before answering, and those
+thinking tokens count against ``max_tokens``. Callers in this codebase ask
+for tiny outputs (``max_tokens=10`` for a one-word label), which would leave
+no room for the answer and come back empty. ``chat_completion`` therefore
+asks reasoning models for low reasoning effort, hides the reasoning text,
+and raises the token budget to at least ``REASONING_MIN_TOKENS``. Callers
+keep passing the size of the answer they want; nothing else changes.
 
 The client is a module-level singleton, created lazily on first use, so
 importing this module is cheap and tests that don't hit the LLM don't need
@@ -28,7 +38,8 @@ streaming variant later without changing callers if we keep this façade.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+import re
+from typing import TYPE_CHECKING, Any
 
 from app.config import settings
 
@@ -44,6 +55,52 @@ class LLMError(RuntimeError):
 
 
 _client: "AsyncGroq | None" = None
+
+
+# Model-id prefixes that produce hidden reasoning tokens before the answer.
+_REASONING_MODEL_PREFIXES: tuple[str, ...] = ("openai/gpt-oss", "qwen/qwen3")
+
+# Minimum completion budget for reasoning models. Low effort usually spends
+# well under this on our short classification prompts; the rest is headroom.
+REASONING_MIN_TOKENS = 1024
+
+# Some reasoning models inline their thinking in <think>...</think>.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def is_reasoning_model(model: str) -> bool:
+    """True if ``model`` emits reasoning tokens that eat into ``max_tokens``."""
+    return model.lower().startswith(_REASONING_MODEL_PREFIXES)
+
+
+def build_completion_kwargs(
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+) -> dict[str, Any]:
+    """Assemble the keyword arguments for ``chat.completions.create``.
+
+    Pure function so the reasoning-model handling can be unit-tested
+    without a network call.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if is_reasoning_model(model):
+        kwargs["max_tokens"] = max(max_tokens, REASONING_MIN_TOKENS)
+        kwargs["reasoning_effort"] = "low"
+        kwargs["include_reasoning"] = False
+    return kwargs
+
+
+def clean_completion_text(content: str) -> str:
+    """Strip inline ``<think>`` blocks some reasoning models emit."""
+    return _THINK_BLOCK_RE.sub("", content).strip()
 
 
 def _get_client() -> "AsyncGroq":
@@ -111,21 +168,23 @@ async def chat_completion(
     client = _get_client()
     target_model = model or settings.GROQ_MODEL_SMART
 
+    kwargs = build_completion_kwargs(
+        model=target_model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
     try:
-        response = await client.chat.completions.create(
-            model=target_model,
-            messages=messages,  # type: ignore[arg-type]
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        response = await client.chat.completions.create(**kwargs)
     except Exception as exc:  # noqa: BLE001 — wrap any SDK/network error
-        logger.warning("Groq chat_completion failed: %s", exc)
+        logger.warning("Groq chat_completion failed (model=%s): %s", target_model, exc)
         raise LLMError(str(exc)) from exc
 
     if not response.choices:
         raise LLMError("Groq returned no choices")
 
-    content = response.choices[0].message.content
+    content = clean_completion_text(response.choices[0].message.content or "")
     if not content:
         raise LLMError("Groq returned an empty message")
 
